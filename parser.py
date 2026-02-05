@@ -2,7 +2,7 @@ import re
 import pdfplumber
 from dateutil import parser as dateparser
 
-VERSION = "v2026-02-05-sinbon-quote-v2"
+VERSION = "v2026-02-05-sinbon-v3-fixedheader-productspec"
 
 OUT_COLS = [
     "Date", "Customer", "Planner", "Product",
@@ -10,10 +10,13 @@ OUT_COLS = [
     "Delivery Term", "MOQ", "Price", "L/T", "Remark"
 ]
 
-# ---------------- utils ----------------
+# ---------------- helpers ----------------
 
 def N(s):
     return re.sub(r"\s+", " ", (s or "").strip())
+
+def strip_bullet(s):
+    return N(re.sub(r"^[\-\u2022•]+", "", (s or "").strip()))
 
 def add_wks(lt):
     lt = N(lt)
@@ -37,13 +40,14 @@ def money_to_float(s):
     except:
         return None
 
-def parse_date(t):
+def parse_date_any(s):
+    # Date: Oct. 14, 2025 / Sep. 22, 2025 / 2025-10-14 등
     for p in [
-        r"[A-Za-z]{3}\.? \d{1,2}, \d{4}",
+        r"[A-Za-z]{3}\.?\s+\d{1,2},\s+\d{4}",
         r"\d{4}-\d{2}-\d{2}",
         r"\d{1,2}-[A-Za-z]{3}-\d{2}",
     ]:
-        m = re.search(p, t)
+        m = re.search(p, s)
         if m:
             try:
                 d = dateparser.parse(m.group(0), fuzzy=True)
@@ -52,253 +56,296 @@ def parse_date(t):
                 return m.group(0)
     return ""
 
-def parse_to_from_attn_line(t):
+def first_nonempty_after_label(lines, label):
     """
-    이 양식은 To/From/Attn/Date가 표에 있고, 실제 값은 아래쪽 한 줄에
-    'Daeyoung ... Sherry Liu' / 'Cha Se Nyoung Oct. 14, 2025' 처럼 나오는 경우가 많음.
+    표 형식에서:
+      To:   (다음 줄에 값)
+    또는
+      To: Daeyoung ...
+    둘 다 지원
     """
-    customer = ""
-    planner = ""
+    lab_re = re.compile(rf"^\s*{re.escape(label)}\s*:\s*(.*)$", re.I)
+    for i, ln in enumerate(lines):
+        m = lab_re.match(ln)
+        if m:
+            tail = N(m.group(1))
+            if tail:
+                # 같은 줄에 값
+                return tail
+            # 다음 줄(들)에서 값 찾기
+            for j in range(i + 1, min(i + 4, len(lines))):
+                v = N(lines[j])
+                if v and not re.match(r"^(To|From|Attn|CC|Date|Ref)\s*:", v, re.I):
+                    return v
+    return ""
 
-    # 가장 흔한: "Daeyoung Chaevi Co., Ltd. Sherry Liu"
-    m = re.search(r"\n([A-Za-z0-9 ,.&()\-]+Co\., Ltd\.)\s+([A-Za-z][A-Za-z .'-]+)\n", t)
-    if m:
-        customer = N(m.group(1))
-        planner = N(m.group(2))
-
-    return customer, planner
-
-def strip_bullet(s):
-    return N(re.sub(r"^[\-\u2022•]+", "", (s or "").strip()))
-
-def is_sample_token(s):
-    return bool(re.search(r"\bSample\b", s or "", re.I))
-
-def is_nre_token(s):
-    return bool(re.search(r"\bNRE\s*List\b", s or "", re.I))
-
-# ---------------- Product block parsing (조건 4~8) ----------------
-
-def split_product_block(lines):
+def parse_header_fields(text):
     """
-    조건:
-    Product= Rated Current 기준 윗줄
-    Rated Current / Cable Length 추출
-    Description = Cable Length 아래 내용(나머지 스펙)
+    ✅ 조건 1~3의 핵심: Date/To/From은 고정 라벨에서만 뽑는다.
     """
-    clean = [strip_bullet(x) for x in lines if strip_bullet(x)]
+    lines = [N(x) for x in (text or "").splitlines() if N(x)]
+
+    customer = first_nonempty_after_label(lines, "To")
+    planner  = first_nonempty_after_label(lines, "From")
+
+    # Date는 "Date:" 라벨에서 우선 찾고, 못 찾으면 전체 텍스트에서 날짜 패턴 탐색
+    date_raw = first_nonempty_after_label(lines, "Date")
+    date_val = parse_date_any(date_raw) if date_raw else parse_date_any(text)
+
+    return date_val, customer, planner
+
+# ---------------- Product cell parsing by your rules ----------------
+
+def parse_product_spec_from_block(block_lines):
+    """
+    조건 4~8:
+    4.Product = Rated Current 기준 윗줄
+    5.Rated Current = 'Rated Current:' 값
+    6.Cable Length  = 'Cable Length:' 값
+    7.Description   = Cable Length 아래 내용
+    8. Rated/Cable은 Description에 반복 금지
+    """
+    clean = [strip_bullet(x) for x in block_lines if strip_bullet(x)]
     if not clean:
         return "", "", "", ""
 
     rated_idx = None
     cable_idx = None
-    rated_val = ""
-    cable_val = ""
+    rated = ""
+    cable = ""
 
     for i, ln in enumerate(clean):
         if re.search(r"Rated\s*Current", ln, re.I):
             rated_idx = i
             parts = ln.split(":", 1)
-            rated_val = N(parts[1]) if len(parts) == 2 else N(ln)
+            rated = N(parts[1]) if len(parts) == 2 else ""
         if re.search(r"Cable\s*Length", ln, re.I):
             cable_idx = i
             parts = ln.split(":", 1)
-            cable_val = N(parts[1]) if len(parts) == 2 else N(ln)
+            cable = N(parts[1]) if len(parts) == 2 else ""
 
+    # Product = rated 기준 윗줄(없으면 첫 줄)
     if rated_idx is not None and rated_idx - 1 >= 0:
-        product_name = clean[rated_idx - 1]
+        product = clean[rated_idx - 1]
     else:
-        product_name = clean[0]
+        product = clean[0]
 
+    # Description = cable 아래
     desc_parts = []
     if cable_idx is not None:
         for ln in clean[cable_idx + 1:]:
             if re.search(r"Rated\s*Current|Cable\s*Length", ln, re.I):
                 continue
+            # 가격표/모큐 같은 숫자열 섞임 방지(아주 중요)
+            if re.search(r"\$\s*[\d,]+\.\d{2}", ln) or re.fullmatch(r"\d+(?:,\d+)?", ln):
+                continue
             desc_parts.append(ln)
     else:
-        start = (rated_idx + 1) if rated_idx is not None else 1
+        # cable이 없으면 rated 아래를 desc로
+        start = rated_idx + 1 if rated_idx is not None else 1
         for ln in clean[start:]:
             if re.search(r"Rated\s*Current|Cable\s*Length", ln, re.I):
+                continue
+            if re.search(r"\$\s*[\d,]+\.\d{2}", ln):
                 continue
             desc_parts.append(ln)
 
     desc = "; ".join([x for x in desc_parts if x])
-    return product_name, rated_val, cable_val, desc
+    return product, rated, cable, desc
 
-# ---------------- Main parsing ----------------
+# ---------------- Main table parsing (text-based, robust) ----------------
 
 def extract_text(pdf_file):
     with pdfplumber.open(pdf_file) as pdf:
         pages = [(p.extract_text() or "") for p in pdf.pages]
     return "\n".join(pages)
 
-def parse_delivery_terms_and_lts(text):
+def split_item_blocks(text):
     """
-    1-1 / 1-2 / 1-3 블록에서 Delivery Term + LT를 뽑아 순서대로 반환
+    SINBON Quotation은 Item 1,2,3.. 또는 1-1/1-2/1-3 형태가 있음.
+    - 우선 1-1/1-2/.. 를 블록으로 자르고,
+    - 없으면 Item 숫자(1,2,3..)로 자른다.
     """
-    terms = []
+    lines = [x.rstrip() for x in (text or "").splitlines()]
 
-    # "Product" 이후에 "1-1 ... FOB Shanghai 8-10" 같이 나오는 부분 사용
-    m = re.search(r"\bProduct\b([\s\S]+?)(?:\bNRE\s*List\b|$)", text, re.I)
-    if not m:
-        return terms
+    if re.search(r"\b\d+\-\d+\b", text):
+        # 1-1, 1-2...
+        chunks = re.split(r"(?m)^\s*(?=\d+\-\d+\b)", "\n".join(lines))
+        blocks = []
+        for c in chunks:
+            c = c.strip("\n")
+            if re.match(r"^\d+\-\d+\b", N(c)):
+                blocks.append(c)
+        return blocks
 
-    blk = m.group(1)
+    # fallback: Item 1,2,3...
+    chunks = re.split(r"(?m)^\s*(?=\d+\s*$)", "\n".join(lines))
+    blocks = []
+    for c in chunks:
+        c = c.strip("\n")
+        if re.match(r"^\d+\s*$", N(c)):
+            blocks.append(c)
+    return blocks
 
-    # item id 기준 분리 (예: 1-1, 1-2, 1-3)
-    parts = re.split(r"\n(?=\d+\-\d+\b)", "\n" + blk)
-    for part in parts:
-        part = part.strip()
-        if not re.match(r"^\d+\-\d+\b", part):
+def parse_delivery_from_block(block_text):
+    """
+    Delivery Term은 FOB/DAP/EXW... + 뒤의 위치(Shanghai/Korea by Sea...)가 줄바꿈으로 찢어질 수 있음.
+    -> FOB가 있으면 그 줄 + 다음 1~2줄을 이어붙인다 (L/T 숫자 나오기 전까지)
+    """
+    lines = [strip_bullet(x) for x in block_text.splitlines() if strip_bullet(x)]
+    if not lines:
+        return ""
+
+    for i, ln in enumerate(lines):
+        if re.search(r"\b(FOB|DAP|EXW|CIF|DDP)\b", ln, re.I):
+            parts = [ln]
+            for j in range(i + 1, min(i + 4, len(lines))):
+                if re.search(r"\b\d{1,2}\s*-\s*\d{1,2}\b", lines[j]):
+                    break
+                # MOQ/가격 라인 방지
+                if re.search(r"\$\s*[\d,]+\.\d{2}", lines[j]):
+                    break
+                parts.append(lines[j])
+            return N(" ".join(parts))
+    return ""
+
+def parse_lt_from_block(block_text):
+    # L/T(wks): 8-10 같은 패턴
+    m = re.search(r"\b(\d{1,2}\s*-\s*\d{1,2})\b", block_text)
+    return add_wks(m.group(1)) if m else ""
+
+def parse_pricing_groups(text):
+    """
+    ✅ 핵심: Delivery Term별 MOQ/Unit Price/LT를 '그 칸에 있는 텍스트'처럼 읽어야 함.
+    구현:
+    - 텍스트를 위에서 아래로 스캔하면서 delivery term을 만나면 current_delivery를 갱신
+    - 이후 나오는 (MOQ, $Price, LT) 패턴들을 해당 delivery에 귀속
+    """
+    lines = [N(x) for x in (text or "").splitlines() if N(x)]
+    groups = {}  # delivery -> list of (moq, price, lt)
+
+    current_delivery = ""
+    for ln in lines:
+        # delivery 후보 라인: FOB/DAP/EXW 포함, $가격은 없는 라인
+        if re.search(r"\b(FOB|DAP|EXW|CIF|DDP)\b", ln, re.I) and not re.search(r"\$", ln):
+            current_delivery = ln
+            # 다음 줄에 위치만 있는 경우가 있어 groups 키는 나중에 합쳐짐
+            groups.setdefault(current_delivery, [])
             continue
 
-        lines = [x.rstrip() for x in part.splitlines() if N(x)]
-        # Delivery term: FOB/DAP/EXW 등으로 시작하는 줄들을 아래에서 위로 조립
-        # 이 문서는 "FOB" 줄 다음에 "Shanghai" 줄 처럼 찢어져 있음
-        dt = ""
-        lt = ""
+        # MOQ+Price+LT 한 줄 (예: 30 $511.88 8-10)
+        m = re.search(r"\b(\d{1,6})\b\s+\$([\d,]+\.\d{2})(?:\s+(\d{1,2}\s*-\s*\d{1,2}))?", ln)
+        if m and current_delivery:
+            moq = int(m.group(1))
+            price = money_to_float(m.group(2))
+            lt = add_wks(m.group(3)) if m.group(3) else ""
+            if price is not None:
+                groups[current_delivery].append((moq, price, lt))
 
-        # LT는 보통 마지막에 "8-10" 같은 숫자
-        for ln in lines[::-1]:
-            mlt = re.search(r"\b(\d{1,2}\s*-\s*\d{1,2})\b", ln)
-            if mlt:
-                lt = add_wks(mlt.group(1))
-                break
-
-        # Delivery term 단어 모으기: FOB / DAP ... 가 있는 위치부터 다음 1~3줄 합치기
-        for i, ln in enumerate(lines):
-            if re.search(r"\b(FOB|DAP|EXW|CIF|DDP)\b", ln, re.I):
-                dt_words = [strip_bullet(ln)]
-                # 다음 줄들 중 LT 숫자 나오기 전까지 붙임
-                for j in range(i + 1, min(i + 5, len(lines))):
-                    if re.search(r"\b\d{1,2}\s*-\s*\d{1,2}\b", lines[j]):
-                        break
-                    dt_words.append(strip_bullet(lines[j]))
-                dt = N(" ".join([w for w in dt_words if w]))
-                break
-
-        if dt:
-            terms.append({"delivery_term": dt, "lt": lt})
-
-    return terms
-
-def parse_moq_price_groups(text, expected_groups):
-    """
-    상단의 MOQ/가격 리스트를 30으로 시작하는 그룹 단위로 묶는다.
-    각 그룹은 (MOQ, price, lt(optional)) row들.
-    - LT는 표에서 병합되어 있을 수 있으니 그룹 내 fill-down
-    """
-    # "30 $511.88" 같은 라인들 뽑기 (줄바꿈이 어색해도 공백 기준)
-    tokens = re.findall(r"\b(\d{1,3}(?:,\d{3})?)\s+\$([\d,]+\.\d{2})(?:\s+(\d{1,2}\s*-\s*\d{1,2}))?\b", text)
-    rows = []
-    for moq_s, price_s, lt_s in tokens:
-        moq = int(moq_s.replace(",", ""))
-        price = money_to_float(price_s)
-        lt = add_wks(lt_s) if lt_s else ""
-        rows.append((moq, price, lt))
-
-    # 그룹화: MOQ=30을 새 그룹 시작으로
-    groups = []
-    cur = []
-    for moq, price, lt in rows:
-        if moq == 30 and cur:
-            groups.append(cur)
-            cur = []
-        cur.append((moq, price, lt))
-    if cur:
-        groups.append(cur)
-
-    # 기대 그룹 수에 맞추기(부족하면 그대로 반환)
-    if expected_groups and len(groups) > expected_groups:
-        groups = groups[:expected_groups]
-
-    # 그룹별 lt fill-down
-    fixed = []
-    for g in groups:
-        out = []
+    # LT fill-down within each delivery group (병합 대응)
+    fixed = {}
+    for d, rows in groups.items():
         last_lt = ""
-        for moq, price, lt in g:
+        out = []
+        for moq, price, lt in rows:
             if lt:
                 last_lt = lt
             out.append((moq, price, lt or last_lt))
-        fixed.append(out)
+        fixed[d] = out
 
+    # delivery 문구가 "FOB" 한 단어로만 잡힌 경우가 있으니,
+    # 인접한 delivery 키를 합치는 간단 보정(FOB + Shanghai 같은 줄분리 대응)
+    # -> 실제론 parse_delivery_from_block이 더 정확하므로, 여기서는 그대로 두고
+    #    item 블록의 delivery와 best-match로 매칭한다.
     return fixed
 
-def parse_nre_list_item(text):
+def best_match_delivery(item_delivery, delivery_keys):
     """
-    NRE List 아래에 있는 치구 1건 파싱(현재 파일 기준).
-    규칙(d):
-    - Delivery Term = NRE List
-    - MOQ = Qty
-    - Price = Unit Price
-    - Product = Description(품목 설명)
-    - Description = Cavity 포함
-    - Amount 제거
+    item 블록에서 뽑은 delivery 문구(item_delivery)와
+    pricing table에서 뽑은 delivery_keys 중 가장 비슷한 것을 선택.
+    """
+    if not item_delivery:
+        return ""
+
+    cand = ""
+    score_best = -1
+    it = item_delivery.lower()
+    for k in delivery_keys:
+        kk = k.lower()
+        score = 0
+        for token in ["fob", "dap", "exw", "cif", "ddp", "shanghai", "korea", "sea", "air", "ferry"]:
+            if token in it and token in kk:
+                score += 2
+        # 공통 단어 수
+        for w in set(it.split()):
+            if w in kk:
+                score += 1
+        if score > score_best:
+            score_best = score
+            cand = k
+    return cand
+
+def parse_nre(text):
+    """
+    조건(d):
+    - NRE List 있으면:
+      Delivery Term='NRE List'
+      MOQ=Qty
+      Price=Unit Price
+      Product=Item Description
+      Description에 Cavity 포함
+      Amount 제외
     """
     if not re.search(r"\bNRE\s*List\b", text, re.I):
         return None
 
-    # NRE List 이후부터 끝까지
     tail = re.split(r"\bNRE\s*List\b", text, flags=re.I)[-1]
-    lines = [x.rstrip() for x in tail.splitlines() if N(x)]
+    lines = [N(x) for x in tail.splitlines() if N(x)]
 
-    # 파일 구조(현재): 첫 줄에 cavity "1"만 나오고,
-    # 다음 여러 줄이 description,
-    # 마지막에 "1 3 $3,000 $9,000 4-6 Necessary for MP"
+    # cavity
     cavity = ""
-    desc_lines = []
-    qty = None
-    unit_price = None
-    lt = ""
-    remark = ""
-
-    # cavity 후보: 단독 숫자 라인
-    for i, ln in enumerate(lines[:10]):
-        if re.fullmatch(r"\d+", N(ln)):
-            cavity = N(ln)
-            start = i + 1
+    for ln in lines[:20]:
+        if re.fullmatch(r"\d+", ln):
+            cavity = ln
             break
-    else:
-        start = 0
 
-    # 마지막 핵심 라인 찾기(Amount 포함)
-    key_idx = None
-    for i in range(len(lines)-1, max(-1, len(lines)-30), -1):
-        ln = lines[i]
+    # qty/unit price/amount/lt/remark가 같이 있는 라인 찾기
+    # 예: "1 3 $3,000 $9,000 4-6 Necessary for MP"
+    key = None
+    for ln in lines:
         if re.search(r"\$\s*[\d,]+\s+\$\s*[\d,]+", ln):
-            key_idx = i
+            key = ln
             break
-
-    if key_idx is None:
+    if not key:
         return None
 
-    # description은 start~key_idx-1
-    desc_lines = lines[start:key_idx]
-    desc_text = N(" ".join(desc_lines))
-
-    # key line 파싱
-    kl = N(lines[key_idx])
-    # 예: "1 3 $3,000 $9,000 4-6 Necessary for MP"
-    m = re.search(r"\b(\d+)\s+(\d+)\s+\$([\d,]+)\s+\$([\d,]+)\s+(\d{1,2}\-\d{1,2})\s*(.*)$", kl)
+    m = re.search(r"\b(\d+)\s+(\d+)\s+\$([\d,]+)\s+\$([\d,]+)\s+(\d{1,2}\-\d{1,2})\s*(.*)$", key)
     if not m:
         return None
-
-    # 첫 숫자는 item/cavity로 보이기도 해서 cavity가 비면 채움
-    if not cavity:
-        cavity = m.group(1)
 
     qty = int(m.group(2))
     unit_price = float(m.group(3).replace(",", ""))
     lt = add_wks(m.group(5))
     remark = N(m.group(6))
 
+    # description(아이템 설명) = key 라인 전까지의 텍스트 중 의미있는 부분
+    # 헤더 단어 제거
+    desc_lines = []
+    for ln in lines:
+        if ln == key:
+            break
+        if re.search(r"\b(Item|Description|Qty|Unit Price|Amount|Remark|L/T)\b", ln, re.I):
+            continue
+        desc_lines.append(ln)
+    product_desc = N(" ".join(desc_lines)) or "NRE"
+
+    description = f"Cavity {cavity}".strip() if cavity else ""
+
     return {
-        "Product": desc_text,
+        "Product": product_desc,
         "Rated Current": "",
         "Cable Length": "",
-        "Description": f"Cavity {cavity}".strip(),
+        "Description": description,
         "Delivery Term": "NRE List",
         "MOQ": qty,
         "Price": unit_price,
@@ -306,74 +353,96 @@ def parse_nre_list_item(text):
         "Remark": remark
     }
 
+# ---------------- entry ----------------
+
 def parse_quote_file(file_obj):
     debug = {}
+
     text = extract_text(file_obj)
 
-    date = parse_date(text)
-    customer, planner = parse_to_from_attn_line(text)
-
+    # ✅ 1~3: header fields
+    date, customer, planner = parse_header_fields(text)
     debug["date"] = date
     debug["customer"] = customer
     debug["planner"] = planner
 
-    # 1) Delivery term + LT (1-1/1-2/1-3 순서)
-    terms = parse_delivery_terms_and_lts(text)
-    debug["delivery_terms_found"] = terms
+    # Item blocks: product spec + delivery term + lt (from item area)
+    item_blocks = split_item_blocks(text)
+    debug["item_blocks"] = len(item_blocks)
 
-    # 2) MOQ/price 그룹 (delivery term 개수만큼)
-    groups = parse_moq_price_groups(text, expected_groups=len(terms))
-    debug["moq_price_groups"] = [len(g) for g in groups]
+    item_infos = []
+    for blk in item_blocks:
+        # 제품 스펙은 Rated Current/Cable Length가 나오는 구간만 사용
+        lines = [x for x in blk.splitlines() if N(x)]
+        # Rated Current가 포함된 주변 20줄만 잘라서 가격표 섞임 제거
+        idxs = [i for i, ln in enumerate(lines) if re.search(r"Rated\s*Current", ln, re.I)]
+        if idxs:
+            i0 = idxs[0]
+            cut = lines[max(0, i0 - 3): min(len(lines), i0 + 25)]
+        else:
+            cut = lines[:30]
+
+        product, rated, cable, desc = parse_product_spec_from_block(cut)
+
+        delivery = parse_delivery_from_block(blk)
+        lt = parse_lt_from_block(blk)
+
+        # item block에 제품 스펙이 없는 경우는 skip (예: 가격표만 있는 조각)
+        if not (product or rated or cable or desc or delivery):
+            continue
+
+        item_infos.append({
+            "product": product,
+            "rated": rated,
+            "cable": cable,
+            "desc": desc,
+            "delivery_item": delivery,
+            "lt_item": lt
+        })
+
+    debug["item_infos"] = item_infos[:3]
+
+    # Pricing groups by delivery term
+    pricing = parse_pricing_groups(text)
+    debug["pricing_keys"] = list(pricing.keys())[:6]
 
     out = []
 
-    # 3) 메인 Product 상세(현재 파일은 1-1에만 제품 스펙이 있고 1-2/1-3도 동일 제품)
-    #    -> Product 블록에서 첫 번째 제품 스펙만 추출해서 공통 적용
-    product_name = ""
-    rated = ""
-    cable = ""
-    desc = ""
+    # ✅ 핵심: “Delivery Term별 MOQ별 row 생성”
+    # item_infos 안의 delivery와 pricing의 delivery 키를 best-match로 연결
+    for info in item_infos:
+        item_delivery = info["delivery_item"]
+        key = best_match_delivery(item_delivery, pricing.keys())
 
-    mprod = re.search(r"\b1\-1\b([\s\S]+?)(?:\b1\-2\b|\bNRE\s*List\b|$)", text)
-    if mprod:
-        lines = [x for x in mprod.group(1).splitlines() if N(x)]
-        # 1-1 다음 첫 줄이 제품명인 경우가 많아서 앞부분 포함
-        # (split_product_block이 Rated Current 기준 위줄을 제품명으로 잡음)
-        product_name, rated, cable, desc = split_product_block(lines)
-
-    debug["main_product"] = {"Product": product_name, "Rated": rated, "Cable": cable, "Desc": desc}
-
-    # 4) DeliveryTerm별 MOQ별 row 생성 + 병합 LT fill-down
-    #    - 그룹 수가 term 수보다 적으면 가능한 만큼만 생성
-    for i, term in enumerate(terms):
-        dt = term.get("delivery_term", "")
-        base_lt = term.get("lt", "")
-
-        if i >= len(groups):
+        # delivery term이 item에서만 잡히고 pricing이 없으면(표 누락) skip
+        if not key or key not in pricing or not pricing[key]:
             continue
 
-        for moq, price, lt in groups[i]:
-            if price is None:
-                continue
+        for moq, price, lt in pricing[key]:
+            remark = ""
+
+            # Sample 처리 (조건 9/12): MOQ에 Sample이라고 적혀있으면 -> 여기서는 pricing가 숫자 기반이므로
+            # Sample 견적서는 별도 케이스에서 처리됨(기존 샘플 형식). 필요시 확장 가능.
+            moq_val = moq
+
             out.append({
                 "Date": date,
                 "Customer": customer,
                 "Planner": planner,
-                "Product": product_name,
-                "Rated Current": rated,
-                "Cable Length": cable,
-                "Description": desc,
-                "Delivery Term": dt,
-                "MOQ": moq,
+                "Product": info["product"],
+                "Rated Current": info["rated"],
+                "Cable Length": info["cable"],
+                "Description": info["desc"],
+                "Delivery Term": N(key),
+                "MOQ": moq_val,
                 "Price": price,
-                "L/T": lt or base_lt,
-                "Remark": ""
+                "L/T": lt or info["lt_item"],
+                "Remark": remark
             })
 
-    # 5) NRE List 품목(있으면 추가)
-    nre = parse_nre_list_item(text)
-    debug["nre_parsed"] = bool(nre)
-
+    # NRE row append
+    nre = parse_nre(text)
+    debug["nre"] = bool(nre)
     if nre:
         out.append({
             "Date": date,
