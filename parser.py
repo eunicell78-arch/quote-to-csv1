@@ -2,7 +2,7 @@ import re
 from typing import List, Dict, Tuple
 from dateutil import parser as dateparser
 
-VERSION = "v2026-02-05-sample3termfix"
+VERSION = "v2026-02-05-sample3termfix2"
 
 OUT_COLS = [
     "Date", "Customer", "Planner", "Product",
@@ -114,73 +114,61 @@ def is_sample(t: str) -> bool:
     return bool(re.search(r"\bSample\b", t, re.I))
 
 
-def _find_price_lt_after(term_regex: str, flat: str) -> Tuple[float, str] | Tuple[None, None]:
-    """
-    term_regex가 등장한 '이후' 구간에서 가격과 L/T를 찾는다.
-    줄바꿈으로 term이 쪼개져도 FLAT에서 term_regex를 유연하게 매칭.
-    """
-    m = re.search(term_regex, flat, flags=re.I)
-    if not m:
-        return None, None
-
-    # term 다음부터 120자 안에서 가격 + lt 찾기 (너무 멀리 가면 오매칭 위험)
-    tail = flat[m.end(): m.end() + 200]
-
-    # $가 사라져도 잡히게: $는 optional
-    pm = re.search(r"\$?\s*([\d,]+\.\d{2})\s+(\d{1,2})\s*-\s*(\d{1,2})", tail)
-    if not pm:
-        return None, None
-
-    price = float(pm.group(1).replace(",", ""))
-    a = int(pm.group(2)); b = int(pm.group(3))
+def _extract_price_lt(m) -> Tuple[float, str] | Tuple[None, None]:
+    price = float(m.group(1).replace(",", ""))
+    a = int(m.group(2)); b = int(m.group(3))
     if not _valid_lt(a, b):
         return None, None
-
     return price, f"{a}-{b}"
 
 
 def parse_sample(t: str) -> List[Tuple[str, int, float, str]]:
+    """
+    샘플 2종 지원:
+    - 1줄형: 1 FOB SH Sample $535.62 4-6
+    - 3줄형: FOB SH ... / DAP KR BY SEA/FERRY ... / DAP KR BY AIR ...
+      (줄바꿈으로 DAP KR BY / AIR / $... 형태로 쪼개져도 FLAT에서 직접 매칭)
+    """
     f = FLAT(t)
-    results: List[Tuple[str, int, float, str]] = []
 
-    # (A) 1줄형 샘플: "1 FOB SH Sample $xxx.xx 4-6"
+    # (1) 1줄형: '1 ... FOB SH ... Sample ... $price lt'
     m = re.search(
-        r"\b1\s+FOB\s*SH\b.*?\bSample\b.*?\$?\s*([\d,]+\.\d{2})\s+(\d{1,2})\s*-\s*(\d{1,2})\b",
+        r"\b1\s+.*?\bFOB\s*SH\b.*?\bSample\b.*?\$?\s*([\d,]+\.\d{2})\s+(\d{1,2})\s*-\s*(\d{1,2})\b",
         f, re.I
     )
     if m:
-        price = float(m.group(1).replace(",", ""))
-        a = int(m.group(2)); b = int(m.group(3))
-        if _valid_lt(a, b):
-            return [("FOB SH", 1, price, f"{a}-{b}")]
+        price, lt = _extract_price_lt(m)
+        if price is not None:
+            return [("FOB SH", 1, price, lt)]
 
-    # (B) 3줄형 샘플: term별로 각각 탐색 (줄바꿈으로 쪼개져도 OK)
-    # 핵심: "DAP KR BY"가 줄바꿈으로 분리돼도 잡히도록 \s* 허용
+    # (2) 3줄형: term별로 직접 매칭 (가장 안정적)
+    # term 뒤에 $가 다음 줄로 내려가도 FLAT에서는 공백으로 붙으므로 \s*로 처리 가능
     term_patterns = [
-        ("FOB SH", r"\bFOB\s*SH\b"),
-        ("DAP KR BY SEA/FERRY", r"\bDAP\s*KR\s*BY\s*SEA\s*/\s*FERRY\b|\bSEA\s*/\s*FERRY\b"),
-        ("DAP KR BY AIR", r"\bDAP\s*KR\s*BY\s*AIR\b|\bAIR\b"),
+        ("FOB SH",
+         r"\bFOB\s*SH\b\s*\$?\s*([\d,]+\.\d{2})\s+(\d{1,2})\s*-\s*(\d{1,2})\b"),
+        ("DAP KR BY SEA/FERRY",
+         r"\bDAP\s*KR\s*BY\s*SEA\s*/\s*FERRY\b\s*\$?\s*([\d,]+\.\d{2})\s+(\d{1,2})\s*-\s*(\d{1,2})\b"),
+        ("DAP KR BY AIR",
+         r"\bDAP\s*KR\s*BY\s*AIR\b\s*\$?\s*([\d,]+\.\d{2})\s+(\d{1,2})\s*-\s*(\d{1,2})\b"),
     ]
 
-    for term, treg in term_patterns:
-        price, lt = _find_price_lt_after(treg, f)
-        if price is not None and lt is not None:
-            # AIR 패턴이 너무 넓어서(주소의 AIR 같은 오매칭) term이 DAP KR BY AIR로 실제 존재할 때 우선
-            if term == "DAP KR BY AIR":
-                # 가능하면 DAP KR BY AIR를 먼저 찾고, 없으면 AIR 단독도 허용
-                p2, lt2 = _find_price_lt_after(r"\bDAP\s*KR\s*BY\s*AIR\b", f)
-                if p2 is not None and lt2 is not None:
-                    price, lt = p2, lt2
-            results.append((term, 1, price, lt))
+    out: List[Tuple[str, int, float, str]] = []
+    for term, pat in term_patterns:
+        m = re.search(pat, f, re.I)
+        if not m:
+            continue
+        price, lt = _extract_price_lt(m)
+        if price is None:
+            continue
+        out.append((term, 1, price, lt))
 
-    # 표준 순서로 정렬 + 중복 제거
+    # 표준 순서 유지
     ordered = []
-    seen = set()
     for term in ["FOB SH", "DAP KR BY SEA/FERRY", "DAP KR BY AIR"]:
-        for r in results:
-            if r[0] == term and term not in seen:
+        for r in out:
+            if r[0] == term:
                 ordered.append(r)
-                seen.add(term)
+                break
     return ordered
 
 
@@ -233,7 +221,6 @@ def parse_sinbon_quote(text: str) -> List[Dict]:
     # Sample
     if is_sample(text):
         rows = parse_sample(text)
-
         for term, q, p, lt in rows:
             out.append({
                 "Date": date,
@@ -249,7 +236,6 @@ def parse_sinbon_quote(text: str) -> List[Dict]:
                 "L/T": lt + "wks",
                 "Remark": "",
             })
-
         return out
 
     # Mass
@@ -274,5 +260,3 @@ def parse_sinbon_quote(text: str) -> List[Dict]:
             })
 
     return out
-
-
