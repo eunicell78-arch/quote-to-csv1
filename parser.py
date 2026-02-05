@@ -1,8 +1,9 @@
 import re
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Any
+import pdfplumber
 from dateutil import parser as dateparser
 
-VERSION = "v2026-02-05-generic-table1"
+VERSION = "v2026-02-05-quote-layout-v1"
 
 OUT_COLS = [
     "Date", "Customer", "Planner", "Product",
@@ -10,57 +11,22 @@ OUT_COLS = [
     "Delivery Term", "MOQ", "Price", "L/T", "Remark"
 ]
 
-# ---------------- util ----------------
+
+# ---------------- utils ----------------
 
 def N(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
-
-def flat(s: str) -> str:
-    return N((s or "").replace("\n", " ").replace("\r", " ").replace("\t", " "))
 
 def add_wks(lt: str) -> str:
     lt = N(lt)
     if not lt:
         return ""
-    # 이미 wks 있으면 그대로
     if re.search(r"\bwks\b", lt, re.I):
         return lt
-    # 6-8 형태면 wks 추가
     m = re.search(r"\b(\d{1,2})\s*-\s*(\d{1,2})\b", lt)
     if m:
         return f"{m.group(1)}-{m.group(2)}wks"
     return lt
-
-def parse_date(text: str) -> str:
-    for p in [
-        r"\d{1,2}-[A-Za-z]{3}-\d{2}",
-        r"[A-Za-z]{3}\.? \d{1,2}, \d{4}",
-        r"\d{4}-\d{2}-\d{2}",
-    ]:
-        m = re.search(p, text)
-        if m:
-            try:
-                d = dateparser.parse(m.group(0), fuzzy=True)
-                return d.strftime("%Y-%m-%d")
-            except Exception:
-                return m.group(0)
-    return ""
-
-def parse_customer(text: str) -> str:
-    # "To:" 라인에서 회사명 우선
-    m = re.search(r"\bTo:\s*([^\n]+)", text, re.I)
-    if m:
-        return N(m.group(1))
-    # fallback: Co., Ltd.
-    m = re.search(r"([A-Za-z0-9 ,.&()\-]+Co\., Ltd\.)", text)
-    return N(m.group(1)) if m else ""
-
-def parse_planner(text: str) -> str:
-    m = re.search(r"\bFrom:\s*([^\n]+)", text, re.I)
-    if m:
-        return N(m.group(1))
-    # fallback
-    return "Sherry Liu" if "Sherry Liu" in text else ""
 
 def money_to_float(s: str) -> Optional[float]:
     if not s:
@@ -70,8 +36,37 @@ def money_to_float(s: str) -> Optional[float]:
         return None
     try:
         return float(m.group(1).replace(",", ""))
-    except Exception:
+    except:
         return None
+
+def parse_date_from_text(t: str) -> str:
+    for p in [
+        r"\d{1,2}-[A-Za-z]{3}-\d{2}",
+        r"[A-Za-z]{3}\.? \d{1,2}, \d{4}",
+        r"\d{4}-\d{2}-\d{2}",
+    ]:
+        m = re.search(p, t)
+        if m:
+            try:
+                d = dateparser.parse(m.group(0), fuzzy=True)
+                return d.strftime("%Y-%m-%d")
+            except:
+                return m.group(0)
+    return ""
+
+def parse_to_from(t: str) -> Tuple[str, str]:
+    cust = ""
+    planner = ""
+
+    m = re.search(r"\bTo:\s*([^\n]+)", t, re.I)
+    if m:
+        cust = N(m.group(1))
+
+    m = re.search(r"\bFrom:\s*([^\n]+)", t, re.I)
+    if m:
+        planner = N(m.group(1))
+
+    return cust, planner
 
 def is_sample_token(s: str) -> bool:
     return bool(re.search(r"\bSample\b", s, re.I))
@@ -79,253 +74,199 @@ def is_sample_token(s: str) -> bool:
 def is_nre_token(s: str) -> bool:
     return bool(re.search(r"\bNRE\s*List\b", s, re.I))
 
-# ---------------- spec splitting (Product cell) ----------------
+def strip_bullet(s: str) -> str:
+    return N(re.sub(r"^[\-\u2022•]+", "", (s or "").strip()))
 
-def split_product_cell(product_cell: str) -> Tuple[str, str, str, str]:
+def cluster_lines(words: List[dict], y_tol: float = 3.0) -> List[List[dict]]:
     """
-    Product 칸에서
-    - Product name
-    - Rated Current
-    - Cable Length
-    - Description(나머지 스펙)
-    분리
+    같은 셀 안에서 y(top)가 비슷한 단어들을 한 줄로 묶음
+    """
+    if not words:
+        return []
+    ws = sorted(words, key=lambda w: (w["top"], w["x0"]))
+    lines: List[List[dict]] = []
+    for w in ws:
+        if not lines:
+            lines.append([w])
+            continue
+        if abs(w["top"] - lines[-1][0]["top"]) <= y_tol:
+            lines[-1].append(w)
+        else:
+            lines.append([w])
+    return lines
 
-    규칙:
-    - Rated Current / Cable Length는 별도 컬럼으로 분리
-    - Description에는 그 외 스펙만
-    - "Cable Length" 아래에 붙는 내용도 Description으로 포함
+def words_to_text(words: List[dict]) -> str:
     """
-    raw = product_cell or ""
-    lines = [N(x) for x in raw.split("\n") if N(x)]
+    단어들을 줄 단위로 합쳐서 텍스트 생성 (줄바꿈 포함)
+    """
+    lines = cluster_lines(words, y_tol=3.0)
+    out_lines = []
+    for ln in lines:
+        ln_sorted = sorted(ln, key=lambda w: w["x0"])
+        out_lines.append(N(" ".join(w["text"] for w in ln_sorted)))
+    return "\n".join([x for x in out_lines if x])
+
+
+# ---------------- Product cell splitting (당신 규칙) ----------------
+
+def split_product_cell_by_rules(product_cell_text: str) -> Tuple[str, str, str, str]:
+    """
+    조건:
+    4) Product= Rated current 기준으로 윗줄
+    5) Rated Current= Product칸의 Rated Current
+    6) Cable Length= Product칸의 Cable Length
+    7) Description= Cable length 아래 내용
+    e) Rated/Cable은 Description에 반복 금지
+    """
+    raw = product_cell_text or ""
+    lines = [strip_bullet(x) for x in raw.split("\n") if strip_bullet(x)]
     if not lines:
         return "", "", "", ""
 
-    # 첫 줄이 품목명인 경우가 대부분
-    product_name = lines[0]
-    rest = lines[1:]
+    rated_idx = None
+    cable_idx = None
+    rated_val = ""
+    cable_val = ""
 
-    rated = ""
-    cable = ""
+    for i, ln in enumerate(lines):
+        if re.search(r"Rated\s*Current", ln, re.I):
+            rated_idx = i
+            parts = ln.split(":", 1)
+            rated_val = N(parts[1]) if len(parts) == 2 else N(ln)
+        if re.search(r"Cable\s*Length", ln, re.I):
+            cable_idx = i
+            parts = ln.split(":", 1)
+            cable_val = N(parts[1]) if len(parts) == 2 else N(ln)
+
+    product_name = ""
+    if rated_idx is not None and rated_idx - 1 >= 0:
+        product_name = lines[rated_idx - 1]
+    else:
+        # fallback: 첫 줄
+        product_name = lines[0]
+
+    # Description: cable length 아래 라인들만
     desc_parts: List[str] = []
+    if cable_idx is not None:
+        after = lines[cable_idx + 1:]
+        for ln in after:
+            # Rated/Cable 반복 제거
+            if re.search(r"Rated\s*Current", ln, re.I):
+                continue
+            if re.search(r"Cable\s*Length", ln, re.I):
+                continue
+            if ln:
+                desc_parts.append(ln)
+    else:
+        # cable length 없으면 rated 아래를 desc로
+        start = (rated_idx + 1) if rated_idx is not None else 1
+        for ln in lines[start:]:
+            if re.search(r"Rated\s*Current|Cable\s*Length", ln, re.I):
+                continue
+            desc_parts.append(ln)
 
-    # bullet/스펙 라인 파싱
-    for ln in rest:
-        ln2 = ln.lstrip("-•").strip()
-        if re.search(r"Rated\s*Current", ln2, re.I):
-            v = re.split(r":", ln2, maxsplit=1)
-            rated = N(v[1]) if len(v) == 2 else N(ln2)
-            continue
-        if re.search(r"Cable\s*Length", ln2, re.I):
-            v = re.split(r":", ln2, maxsplit=1)
-            cable = N(v[1]) if len(v) == 2 else N(ln2)
-            continue
+    desc = "; ".join([x for x in desc_parts if x])
+    return product_name, rated_val, cable_val, desc
 
-        # Rated/Cable이 아니면 Description으로
-        if ln2:
-            desc_parts.append(ln2)
 
-    # Description에는 Rated/Cable 반복 금지
-    desc = "; ".join([p for p in desc_parts if p])
+# ---------------- Table reconstruction by coordinates ----------------
 
-    return product_name, rated, cable, desc
-
-# ---------------- table normalization ----------------
-
-def normalize_table(table: List[List[Optional[str]]]) -> List[List[str]]:
-    out = []
-    for row in table:
-        out.append([N(c or "") for c in row])
-    return out
-
-def find_header_row(rows: List[List[str]]) -> Optional[int]:
+def find_header_y_and_columns(words: List[dict]) -> Tuple[Optional[float], Optional[float], Optional[Dict[str, Tuple[float, float]]]]:
     """
-    Item / Product / Delivery Term / MOQ / Unit Price / L/T 같은 헤더 찾기
+    헤더 키워드들(Item, Product, Delivery, MOQ, Unit Price, L/T, Remark) 위치로
+    표 영역과 컬럼 x-range 추정
     """
-    for i, r in enumerate(rows):
-        joined = " ".join(r).lower()
-        if ("item" in joined and "product" in joined and "moq" in joined and ("unit price" in joined or "price" in joined)):
-            return i
+    # 키워드 후보(대소문자 변형 대응)
+    keys = {
+        "item": ["item"],
+        "product": ["product"],
+        "delivery": ["delivery", "term"],
+        "moq": ["moq", "qty"],
+        "price": ["unit", "price"],
+        "lt": ["l/t", "wks", "weeks", "lt"],
+        "remark": ["remark"],
+    }
+
+    # 헤더 단어들을 찾고, 같은 y대(줄)에 있는지 판단
+    candidates = []
+    for w in words:
+        t = w["text"].lower()
+        for k, toks in keys.items():
+            if t in toks:
+                candidates.append((k, w))
+                break
+
+    if not candidates:
+        return None, None, None
+
+    # 가장 많이 겹치는 y대를 헤더로 선택
+    # y를 5pt 단위로 버킷팅
+    buckets: Dict[int, List[Tuple[str, dict]]] = {}
+    for k, w in candidates:
+        b = int(w["top"] // 5)
+        buckets.setdefault(b, []).append((k, w))
+
+    # 버킷 중에서 item+product+moq+price 조합이 있는 것을 우선
+    def score(bucket_items):
+        present = {k for k, _ in bucket_items}
+        base = 0
+        for need in ["item", "product", "moq", "price"]:
+            if need in present:
+                base += 2
+        for opt in ["delivery", "lt", "remark"]:
+            if opt in present:
+                base += 1
+        return base
+
+    best_bucket = max(buckets.items(), key=lambda kv: score(kv[1]))[0]
+    header_items = buckets[best_bucket]
+
+    header_top = min(w["top"] for _, w in header_items)
+    header_bottom = max(w["bottom"] for _, w in header_items)
+
+    # 각 키의 x 위치 추정(왼쪽 x0)
+    x_positions: Dict[str, float] = {}
+    for k, w in header_items:
+        # 'unit'과 'price'가 분리되어 있을 수 있으니 price는 둘 다 있을 때 더 왼쪽 사용
+        if k not in x_positions:
+            x_positions[k] = w["x0"]
+        else:
+            x_positions[k] = min(x_positions[k], w["x0"])
+
+    # 최소 필요 컬럼
+    if "product" not in x_positions or "moq" not in x_positions or "price" not in x_positions:
+        return None, None, None
+
+    # 컬럼 순서대로 정렬하여 range 구성
+    # 누락된 컬럼은 나중에 None 처리 가능
+    order = ["item", "product", "delivery", "moq", "price", "lt", "remark"]
+    xs = [(k, x_positions[k]) for k in order if k in x_positions]
+    xs.sort(key=lambda kv: kv[1])
+
+    # range는 인접 컬럼의 중간값으로 자름
+    col_ranges: Dict[str, Tuple[float, float]] = {}
+    for i, (k, x) in enumerate(xs):
+        left = x - 2
+        right = (xs[i + 1][1] - 2) if i + 1 < len(xs) else 1e9
+        if i > 0:
+            left = (xs[i - 1][1] + x) / 2
+        if i + 1 < len(xs):
+            right = (x + xs[i + 1][1]) / 2
+        col_ranges[k] = (left, right)
+
+    return header_bottom, header_top, col_ranges
+
+
+def collect_table_region_words(words: List[dict], header_bottom: float) -> List[dict]:
+    # 헤더 아래 단어들
+    return [w for w in words if w["top"] > header_bottom + 1]
+
+
+def find_notes_top(words: List[dict]) -> Optional[float]:
+    for w in words:
+        if w["text"].strip().lower().startswith("notes"):
+            return w["top"]
     return None
 
-def repeat_merged_down(rows: List[List[str]]) -> List[List[str]]:
-    """
-    병합된 부분(빈칸)을 위 행 값으로 채우기(컬럼 단위)
-    """
-    if not rows:
-        return rows
-    cols = max(len(r) for r in rows)
-    prev = [""] * cols
-    out = []
-    for r in rows:
-        rr = r + [""] * (cols - len(r))
-        filled = []
-        for j in range(cols):
-            v = rr[j]
-            if v == "":
-                v = prev[j]
-            filled.append(v)
-        out.append(filled)
-        prev = filled
-    return out
 
-def detect_col_idx(header: List[str]) -> Dict[str, int]:
-    """
-    헤더에서 각 컬럼 인덱스 추정
-    """
-    idx = {}
-    for j, c in enumerate(header):
-        cl = c.lower()
-        if "item" == cl or cl.startswith("item"):
-            idx["item"] = j
-        if "product" in cl:
-            idx["product"] = j
-        if "delivery" in cl:
-            idx["delivery"] = j
-        if "moq" in cl or "qty" in cl:
-            idx["moq"] = j
-        if "unit price" in cl or (cl == "price"):
-            idx["price"] = j
-        if "l/t" in cl or "lt" == cl or "wks" in cl:
-            idx["lt"] = j
-        if "remark" in cl:
-            idx["remark"] = j
-    return idx
-
-# ---------------- main parsing ----------------
-
-def parse_quote_pdf(extracted_text: str, extracted_tables: List[List[List[str]]]) -> List[Dict]:
-    """
-    범용(표 기반) 변환:
-    - 표에서 Item row들을 읽고
-    - Product cell에서 Rated/Cable/Description 분리
-    - Delivery Term / MOQ / Price / LT를 row별로 구성
-    - 조건(샘플/NRE/Amount 제거 등) 반영
-    """
-    text = extracted_text or ""
-    date = parse_date(text)
-    customer = parse_customer(text)
-    planner = parse_planner(text)
-
-    # 표 후보들을 돌면서 "Quotation 메인 표" 찾기
-    best_rows = None
-    for tb in extracted_tables or []:
-        rows = normalize_table(tb)
-        hidx = find_header_row(rows)
-        if hidx is None:
-            continue
-        body = rows[hidx+1:]
-        if len(body) >= 1:
-            best_rows = rows[hidx:]  # header 포함
-            break
-
-    if not best_rows:
-        return []
-
-    header = best_rows[0]
-    body = best_rows[1:]
-
-    # 병합칸 반복 채우기
-    body = repeat_merged_down(body)
-
-    col = detect_col_idx(header)
-
-    # 필수 컬럼 없으면 실패
-    if "product" not in col or "moq" not in col or "price" not in col:
-        return []
-
-    out: List[Dict] = []
-
-    # 표 밖에서 공통 LT / 공통 Delivery Term이 따로 있을 수도 있으니 fallback 준비
-    global_lt = ""
-    m = re.search(r"\b(\d{1,2})\s*-\s*(\d{1,2})\b", text)
-    if m:
-        global_lt = add_wks(f"{m.group(1)}-{m.group(2)}")
-
-    global_delivery = ""
-    md = re.search(r"\bFOB\b\s*[A-Za-z]+", text, re.I)
-    if md:
-        global_delivery = N(md.group(0))
-
-    for r in body:
-        product_cell = r[col["product"]] if col["product"] < len(r) else ""
-        moq_cell = r[col["moq"]] if col["moq"] < len(r) else ""
-        price_cell = r[col["price"]] if col["price"] < len(r) else ""
-
-        delivery_cell = r[col["delivery"]] if ("delivery" in col and col["delivery"] < len(r)) else ""
-        lt_cell = r[col["lt"]] if ("lt" in col and col["lt"] < len(r)) else ""
-        remark_cell = r[col["remark"]] if ("remark" in col and col["remark"] < len(r)) else ""
-
-        # 빈 row 스킵
-        if not any([product_cell, moq_cell, price_cell, delivery_cell, lt_cell]):
-            continue
-
-        # Amount는 애초에 컬럼을 안 쓰므로 제거 조건 충족
-
-        product_name, rated, cable, desc = split_product_cell(product_cell)
-
-        # Delivery Term
-        delivery = delivery_cell or global_delivery
-
-        # L/T
-        lt = add_wks(lt_cell) if lt_cell else global_lt
-
-        # MOQ 처리
-        remark_add = ""
-        moq_val: Optional[int] = None
-
-        # MOQ가 "Sample"이면 MOQ=1, Remark에 Sample
-        if is_sample_token(moq_cell):
-            moq_val = 1
-            remark_add = "Sample"
-        else:
-            # 숫자만 추출
-            mqty = re.search(r"\b(\d+)\b", moq_cell)
-            moq_val = int(mqty.group(1)) if mqty else None
-
-        # 가격
-        price = money_to_float(price_cell)
-
-        # NRE List special
-        # - Delivery Term에 NRE List 표시
-        # - MOQ = Qty
-        # - Unit Price만 사용
-        # - Product 칸에 Description, Cavity 정보는 Description 포함
-        if is_nre_token(delivery_cell) or is_nre_token(product_cell) or is_nre_token(text):
-            delivery = "NRE List"
-            # Product를 “설명성 텍스트”로 두는 경우가 많아서, product_name이 빈/의미없으면 raw를 넣음
-            if not product_name:
-                product_name = N(product_cell)
-            # Cavity 같은 키워드가 있으면 Description으로
-            cav = ""
-            mcav = re.search(r"\bCavity\s*\d+\b", product_cell, re.I)
-            if mcav:
-                cav = mcav.group(0)
-            if cav and cav not in desc:
-                desc = (desc + "; " + cav).strip("; ").strip()
-            # MOQ는 Qty에서
-            if moq_val is None:
-                moq_val = 1
-
-        # Remark 합치기
-        remark = "; ".join([x for x in [remark_cell, remark_add] if N(x)])
-
-        # MOQ/Price가 없는 row는 스킵
-        if moq_val is None or price is None:
-            continue
-
-        out.append({
-            "Date": date,
-            "Customer": customer,
-            "Planner": planner,
-            "Product": product_name,
-            "Rated Current": rated,
-            "Cable Length": cable,
-            "Description": desc,
-            "Delivery Term": delivery,
-            "MOQ": moq_val,
-            "Price": price,
-            "L/T": lt,
-            "Remark": remark,
-        })
-
-    return out
+def extract_rows_by_item_anchor(table_words: List[dict], col_ranges: Dict[str, Tuple[float, float]], notes_top: Optional[float]) -> List[Dict[str, str]]()_
