@@ -210,4 +210,48 @@ def parse_sinbon_quote(text: str) -> List[Dict]:
                 "Planner": planner,
                 "Product": product,
                 "Rated Current": rated,
-                "Cable Len
+                "Cable Length": cable,
+                "Description": description,
+                "Delivery Term": r["Delivery Term"],
+                "MOQ": r["MOQ"],
+                "Price": r["Price"],
+                "L/T": (r["L/T"] + "wks") if r.get("L/T") else "",
+                "Remark": "",
+            })
+        return out
+
+    # Mass production (MOQ 20/50 등)
+    pairs = _extract_moq_price_pairs(text)  # 기대: 6개 (3 term * 2 MOQ)
+    lts = _extract_lts(text)                # 기대: 2개(6-8,8-10) 또는 3개
+
+    # LT 매핑 보정(관측된 양산 템플릿 기준)
+    if len(lts) >= 3:
+        term_lts = lts[:3]
+    elif len(lts) == 2:
+        term_lts = [lts[0], lts[1], lts[0]]
+    elif len(lts) == 1:
+        term_lts = [lts[0], lts[0], lts[0]]
+    else:
+        term_lts = ["", "", ""]
+
+    out: List[Dict] = []
+    for i, term in enumerate(DELIVERY_TERMS):
+        chunk = pairs[i * 2:(i * 2) + 2]
+        for moq, price in chunk:
+            lt = term_lts[i]
+            out.append({
+                "Date": date,
+                "Customer": customer,
+                "Planner": planner,
+                "Product": product,
+                "Rated Current": rated,
+                "Cable Length": cable,
+                "Description": description,
+                "Delivery Term": term,
+                "MOQ": moq,
+                "Price": price,
+                "L/T": (lt + "wks") if lt else "",
+                "Remark": "",
+            })
+
+    return out
