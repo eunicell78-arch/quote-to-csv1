@@ -2,7 +2,7 @@ import re
 from typing import List, Dict, Tuple
 from dateutil import parser as dateparser
 
-VERSION = "v2026-02-05-sample3termfix3"
+VERSION = "v2026-02-05-sample3termfix4"
 
 OUT_COLS = [
     "Date", "Customer", "Planner", "Product",
@@ -108,78 +108,87 @@ def _valid_lt(a: int, b: int) -> bool:
     return 1 <= a <= 30 and 1 <= b <= 30
 
 
-def _extract_price_lt_from_match(m) -> Tuple[float, str] | Tuple[None, None]:
-    price = float(m.group(1).replace(",", ""))
-    a = int(m.group(2))
-    b = int(m.group(3))
-    if not _valid_lt(a, b):
-        return None, None
-    return price, f"{a}-{b}"
-
-
 # ---------------- SAMPLE ----------------
 
 def is_sample(t: str) -> bool:
     return bool(re.search(r"\bSample\b", t, re.I))
 
 
-def _find_term_price_lt(flat: str, anchor_pat: str) -> Tuple[float, str] | Tuple[None, None]:
-    """
-    anchor_pat(운임 키워드)을 찾은 뒤, 그 '근처'에서 $price + lt 를 찾는다.
-    문구가 쪼개져도 되도록 anchor_pat은 느슨하게 작성.
-    """
-    am = re.search(anchor_pat, flat, flags=re.I)
-    if not am:
-        return None, None
-
-    tail = flat[am.end(): am.end() + 260]
-
-    # $는 없어도 되게
-    pm = re.search(r"\$?\s*([\d,]+\.\d{2})\s+(\d{1,2})\s*-\s*(\d{1,2})", tail)
-    if not pm:
-        return None, None
-
-    return _extract_price_lt_from_match(pm)
-
-
 def parse_sample(t: str) -> List[Tuple[str, int, float, str]]:
+    """
+    핵심 아이디어:
+    - PDF 텍스트는 term 앞/뒤로 가격이 뒤집혀 나올 수 있음
+    - 그래서 term(FOB/SEA/AIR)의 위치를 잡고,
+      가장 가까운 ($price + lt) 토큰을 '앞/뒤' 모두에서 매칭함
+    """
     f = FLAT(t)
 
-    # (1) 1줄형 샘플: "1 ... FOB SH ... Sample ... $xxx.xx 4-6"
+    # 1줄형 샘플(FOB만 있는 형태) 먼저 처리
     m = re.search(
         r"\b1\b.*?\bFOB\s*SH\b.*?\bSample\b.*?\$?\s*([\d,]+\.\d{2})\s+(\d{1,2})\s*-\s*(\d{1,2})\b",
         f, re.I
     )
     if m:
-        price, lt = _extract_price_lt_from_match(m)
-        if price is not None:
-            return [("FOB SH", 1, price, lt)]
+        price = float(m.group(1).replace(",", ""))
+        a = int(m.group(2)); b = int(m.group(3))
+        if _valid_lt(a, b):
+            return [("FOB SH", 1, price, f"{a}-{b}")]
 
-    rows: Dict[str, Tuple[str, int, float, str]] = {}
+    # 가격+LT 토큰들을 전부 수집 (위치 포함)
+    price_tokens = []
+    for pm in re.finditer(r"\$?\s*([\d,]+\.\d{2})\s+(\d{1,2})\s*-\s*(\d{1,2})\b", f):
+        price = float(pm.group(1).replace(",", ""))
+        a = int(pm.group(2)); b = int(pm.group(3))
+        if not _valid_lt(a, b):
+            continue
+        price_tokens.append((pm.start(), price, f"{a}-{b}"))
 
-    # (2) 3줄형 샘플: 문구가 심하게 쪼개져도 잡히도록 "근접 키워드" 기반으로 탐색
-    # FOB: "FOB" + "SH"
-    price, lt = _find_term_price_lt(f, r"\bFOB\b\s*SH\b")
-    if price is not None:
-        rows["FOB SH"] = ("FOB SH", 1, price, lt)
+    if not price_tokens:
+        return []
 
-    # SEA/FERRY: "SEA" 근처에 "FERRY"가 함께 등장하는 구간을 anchor로
-    # DAP KR BY 가 있으면 더 좋지만 없을 수도 있어서 SEA+FERRY 위주로 찾음
-    price, lt = _find_term_price_lt(f, r"\bSEA\b(?:.{0,40})\bFERRY\b")
-    if price is not None:
-        rows["DAP KR BY SEA/FERRY"] = ("DAP KR BY SEA/FERRY", 1, price, lt)
+    # term 앵커 위치들
+    term_anchors = {
+        "FOB SH": [],
+        "DAP KR BY SEA/FERRY": [],
+        "DAP KR BY AIR": [],
+    }
 
-    # AIR: "DAP KR BY" 근처에 AIR가 등장하는 구간을 우선, 없으면 AIR 단독으로 보조
-    price, lt = _find_term_price_lt(f, r"\bDAP\b(?:.{0,30})\bKR\b(?:.{0,30})\bBY\b(?:.{0,30})\bAIR\b")
-    if price is not None:
-        rows["DAP KR BY AIR"] = ("DAP KR BY AIR", 1, price, lt)
-    else:
-        price, lt = _find_term_price_lt(f, r"\bAIR\b")
-        if price is not None:
-            rows["DAP KR BY AIR"] = ("DAP KR BY AIR", 1, price, lt)
+    for am in re.finditer(r"\bFOB\s*SH\b", f, re.I):
+        term_anchors["FOB SH"].append(am.start())
 
-    # 표준 순서로 반환
-    ordered: List[Tuple[str, int, float, str]] = []
+    for am in re.finditer(r"\bSEA\s*/\s*FERRY\b", f, re.I):
+        term_anchors["DAP KR BY SEA/FERRY"].append(am.start())
+
+    # AIR는 단독 등장만으로는 오매칭 위험이 낮지만, 그래도 word boundary로 제한
+    for am in re.finditer(r"\bAIR\b", f, re.I):
+        term_anchors["DAP KR BY AIR"].append(am.start())
+
+    def pick_nearest(anchor_positions: List[int]) -> Tuple[float, str] | Tuple[None, None]:
+        if not anchor_positions:
+            return None, None
+
+        best = None  # (distance, price, lt)
+        for a_pos in anchor_positions:
+            for p_pos, price, lt in price_tokens:
+                dist = abs(p_pos - a_pos)
+                # 너무 멀면 엉뚱한 매칭이 될 수 있어서 제한 (넉넉하게 220)
+                if dist > 220:
+                    continue
+                cand = (dist, price, lt)
+                if best is None or cand[0] < best[0]:
+                    best = cand
+
+        if best is None:
+            return None, None
+        return best[1], best[2]
+
+    rows = {}
+    for term in ["FOB SH", "DAP KR BY SEA/FERRY", "DAP KR BY AIR"]:
+        price, lt = pick_nearest(term_anchors[term])
+        if price is not None and lt is not None:
+            rows[term] = (term, 1, price, lt)
+
+    ordered = []
     for term in ["FOB SH", "DAP KR BY SEA/FERRY", "DAP KR BY AIR"]:
         if term in rows:
             ordered.append(rows[term])
@@ -201,8 +210,7 @@ def parse_mass(t: str):
     raw_lts = re.findall(r"\b(\d{1,2})\s*-\s*(\d{1,2})\b", t)
     lts = []
     for a, b in raw_lts:
-        a = int(a)
-        b = int(b)
+        a = int(a); b = int(b)
         if _valid_lt(a, b):
             lt = f"{a}-{b}"
             if lt not in lts:
