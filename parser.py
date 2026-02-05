@@ -16,229 +16,185 @@ DELIVERY_TERMS = [
 ]
 
 
-def _norm(s: str) -> str:
+# ---------------- BASIC ----------------
+
+def N(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
 
-def _flat(text: str) -> str:
-    # 줄바꿈/탭을 공백으로 치환해서 패턴 매칭을 쉽게 함
-    return _norm(text.replace("\t", " ").replace("\r", "\n"))
+def FLAT(t: str) -> str:
+    return N(t.replace("\n", " ").replace("\r", " ").replace("\t", " "))
 
 
-def _to_date(raw: str) -> str:
-    raw = _norm(raw)
-    if not raw:
-        return ""
-    try:
-        dt = dateparser.parse(raw, fuzzy=True, dayfirst=True)
-        return dt.strftime("%Y-%m-%d")
-    except Exception:
-        return raw
+# ---------------- DATE ----------------
 
-
-def _extract_date(text: str) -> str:
-    # 16-Dec-25
-    m = re.search(r"\b(\d{1,2}-[A-Za-z]{3}-\d{2})\b", text)
-    if m:
-        return _to_date(m.group(1))
-
-    # Nov. 19, 2025 / Dec. 22, 2025
-    m = re.search(r"\b([A-Za-z]{3}\.? \d{1,2}, \d{4})\b", text)
-    if m:
-        return _to_date(m.group(1))
-
-    # 2025-12-16
-    m = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", text)
-    if m:
-        return _to_date(m.group(1))
-
+def get_date(t: str) -> str:
+    for p in [
+        r"\d{1,2}-[A-Za-z]{3}-\d{2}",
+        r"[A-Za-z]{3}\.? \d{1,2}, \d{4}",
+        r"\d{4}-\d{2}-\d{2}"
+    ]:
+        m = re.search(p, t)
+        if m:
+            try:
+                d = dateparser.parse(m.group(0), fuzzy=True)
+                return d.strftime("%Y-%m-%d")
+            except:
+                return m.group(0)
     return ""
 
 
-def _extract_customer_planner(text: str) -> Tuple[str, str]:
-    t = text or ""
+# ---------------- CUSTOMER / PLANNER ----------------
 
-    # Customer: Co., Ltd. 중 SINBON/Jiangyin 제외하고 첫 번째를 고객으로
+def get_customer_planner(t: str):
+
     customer = ""
-    candidates = re.findall(r"([A-Za-z0-9 ,.&()\-]+Co\., Ltd\.)", t)
-    for c in candidates:
-        cu = c.upper()
-        if "SINBON" in cu or "JIANGYIN" in cu:
-            continue
-        customer = _norm(c)
-        break
 
-    # Planner: Sherry Liu가 있으면 그걸로 고정(대부분 그렇습니다)
-    planner = "Sherry Liu" if re.search(r"\bSherry Liu\b", t) else ""
+    for c in re.findall(r"[A-Za-z0-9 ,.&()\-]+Co\., Ltd\.", t):
+        if "SINBON" not in c.upper():
+            customer = N(c)
+            break
+
+    planner = "Sherry Liu" if "Sherry Liu" in t else ""
 
     return customer, planner
 
 
-def _extract_product_and_specs(text: str) -> Tuple[str, str, str, List[str]]:
-    t = text or ""
+# ---------------- PRODUCT / SPEC ----------------
 
-    # Product: NACS Charging Cable 또는 NACS Charging Cable_J3400 등
+def _clean_rated(x: str) -> str:
+    # 200A/250A 형태까지만 남김
+    m = re.search(r"\d+\s*A\s*/\s*\d+\s*A", x, re.I)
+    if m:
+        return m.group(0).replace(" ", "")
+    m = re.search(r"\d+\s*A", x, re.I)
+    if m:
+        return m.group(0).replace(" ", "")
+    return N(x)
+
+
+def _clean_cable(x: str) -> str:
+    # 3.5M / 4M / 7.62M 형태까지만 남김
+    m = re.search(r"\d+(?:\.\d+)?\s*M", x, re.I)
+    if m:
+        return m.group(0).replace(" ", "")
+    return N(x)
+
+
+def get_product_specs(t: str):
+
     product = ""
     m = re.search(r"\b(NACS Charging Cable(?:_[A-Za-z0-9]+)?)\b", t)
     if m:
-        product = _norm(m.group(1))
+        product = N(m.group(1))
 
-    # Rated Current
     rated = ""
-    m = re.search(r"(?i)Rated\s*Current\s*:\s*([^\n\r\-•]+)", t)
+    m = re.search(r"Rated\s*Current\s*:\s*([^\n\-•]+)", t, re.I)
     if m:
-        rated = _norm(m.group(1))
+        rated = _clean_rated(m.group(1))
 
-    # Cable Length
     cable = ""
-    m = re.search(r"(?i)Cable\s*Length\s*:\s*([^\n\r\-•]+)", t)
+    m = re.search(r"Cable\s*Length\s*:\s*([^\n\-•]+)", t, re.I)
     if m:
-        cable = _norm(m.group(1))
+        cable = _clean_cable(m.group(1))
 
-    # 기타 스펙(Description에 넣을 것)
-    others: List[str] = []
+    desc = []
 
-    # Production Site
-    m = re.search(r"(?i)Production\s*Site\s*:\s*([^\n\r\-•]+)", t)
+    m = re.search(r"Production\s*Site\s*:\s*([^\n\-•]+)", t, re.I)
     if m:
-        others.append("Production Site: " + _norm(m.group(1)))
+        desc.append("Production Site: " + N(m.group(1)))
 
-    # KC Certification (문구만 있는 타입)
-    if re.search(r"(?i)\bKC\s*Certification\b", t):
-        others.append("KC Certification")
+    if re.search(r"KC\s*Certification", t, re.I):
+        desc.append("KC Certification")
 
-    return product, rated, cable, others
-
-
-def _extract_moq_price_pairs(text: str) -> List[Tuple[int, float]]:
-    pairs = re.findall(r"\b(\d{1,6})\s+\$([\d,]+\.\d{2})\b", text)
-    out: List[Tuple[int, float]] = []
-    for moq, price in pairs:
-        try:
-            out.append((int(moq), float(price.replace(",", ""))))
-        except Exception:
-            continue
-    return out
+    return product, rated, cable, desc
 
 
-def _extract_lts(text: str) -> List[str]:
-    # 6-8 / 8-10 / 4-6 등
-    lts = re.findall(r"\b(\d{1,2}\s*-\s*\d{1,2})\b", text)
-    out: List[str] = []
-    for x in lts:
-        x = x.replace(" ", "")
-        if x not in out:
-            out.append(x)
-    return out
+# ---------------- SAMPLE ----------------
+
+def is_sample(t: str):
+    return bool(re.search(r"\bSample\b", t, re.I))
 
 
-def _is_sample(text: str) -> bool:
-    # "Sample"이 들어가면 샘플로 취급 (두 샘플 PDF 모두 해당)
-    return bool(re.search(r"(?i)\bSample\b", text))
+def parse_sample(t: str):
 
+    f = FLAT(t)
+    rows = []
 
-def _extract_sample_rows(text: str) -> List[Dict]:
-    """
-    Sample 견적 2가지 패턴 지원:
-    1) 한 줄: "1 FOB SH Sample $535.62 4-6"
-    2) 운임별: "FOB SH $535.62 4-6 ... DAP KR BY SEA/FERRY $610.01 6-8 ... 1 Sample"
-    """
-    f = _flat(text)
+    m = re.search(
+        r"1\s+FOB SH\s+.*?Sample\s+\$([\d,]+\.\d{2})\s+(\d+-\d+)",
+        f, re.I
+    )
 
-    rows: List[Dict] = []
-
-    # (패턴 1) 1 FOB SH Sample $535.62 4-6
-    m = re.search(r"\b1\s+(FOB SH)\s+Sample\s+\$([\d,]+\.\d{2})\s+(\d{1,2}-\d{1,2})\b", f, flags=re.I)
     if m:
-        rows.append({
-            "Delivery Term": "FOB SH",
-            "MOQ": 1,
-            "Price": float(m.group(2).replace(",", "")),
-            "L/T": m.group(3).replace(" ", "")
-        })
+        rows.append(("FOB SH", 1,
+                     float(m.group(1).replace(",", "")),
+                     m.group(2)))
         return rows
 
-    # (패턴 1-변형) 1 FOB SH Sample $535.62 4-6 (중간 공백/문구 흔들림)
-    m = re.search(r"\b1\s+(FOB SH)\s+.*?\bSample\b\s+\$([\d,]+\.\d{2})\s+(\d{1,2}-\d{1,2})\b", f, flags=re.I)
-    if m:
-        rows.append({
-            "Delivery Term": "FOB SH",
-            "MOQ": 1,
-            "Price": float(m.group(2).replace(",", "")),
-            "L/T": m.group(3).replace(" ", "")
-        })
-        return rows
-
-    # (패턴 2) term별 가격/리드타임
-    term_patterns = [
-        ("FOB SH", r"\bFOB SH\s+\$([\d,]+\.\d{2})\s+(\d{1,2}-\d{1,2})\b"),
-        ("DAP KR BY SEA/FERRY", r"\bDAP KR BY SEA/FERRY\s+\$([\d,]+\.\d{2})\s+(\d{1,2}-\d{1,2})\b"),
-        ("DAP KR BY AIR", r"\bDAP KR BY AIR\s+\$([\d,]+\.\d{2})\s+(\d{1,2}-\d{1,2})\b"),
+    patterns = [
+        ("FOB SH", r"FOB SH\s+\$([\d,]+\.\d{2})\s+(\d+-\d+)"),
+        ("DAP KR BY SEA/FERRY", r"SEA/FERRY\s+\$([\d,]+\.\d{2})\s+(\d+-\d+)"),
+        ("DAP KR BY AIR", r"AIR\s+\$([\d,]+\.\d{2})\s+(\d+-\d+)"),
     ]
 
-    for term, pat in term_patterns:
-        m = re.search(pat, f, flags=re.I)
+    for term, p in patterns:
+        m = re.search(p, f, re.I)
         if m:
-            rows.append({
-                "Delivery Term": term,
-                "MOQ": 1,
-                "Price": float(m.group(1).replace(",", "")),
-                "L/T": m.group(2).replace(" ", "")
-            })
+            rows.append((term, 1,
+                         float(m.group(1).replace(",", "")),
+                         m.group(2)))
 
     return rows
 
 
+# ---------------- MASS ----------------
+
+def parse_mass(t: str):
+
+    pairs = re.findall(r"(\d+)\s+\$([\d,]+\.\d{2})", t)
+    data = []
+
+    for q, p in pairs:
+        try:
+            data.append((int(q), float(p.replace(",", ""))))
+        except:
+            pass
+
+    lts = re.findall(r"\b(\d+-\d+)\b", t)
+    lts = list(dict.fromkeys(lts))
+
+    if len(lts) == 2:
+        lts = [lts[0], lts[1], lts[0]]
+    if len(lts) == 1:
+        lts = [lts[0], lts[0], lts[0]]
+    if not lts:
+        lts = ["", "", ""]
+
+    return data, lts[:3]
+
+
+# ---------------- MAIN ----------------
+
 def parse_sinbon_quote(text: str) -> List[Dict]:
+
     if not text:
         return []
 
-    date = _extract_date(text)
-    customer, planner = _extract_customer_planner(text)
-    product, rated, cable, other_specs = _extract_product_and_specs(text)
+    date = get_date(text)
+    customer, planner = get_customer_planner(text)
+    product, rated, cable, desc = get_product_specs(text)
 
-    description = "; ".join([s for s in other_specs if _norm(s)])
+    description = "; ".join(desc)
+
+    out = []
 
     # Sample
-    if _is_sample(text):
-        sample_rows = _extract_sample_rows(text)
-        out: List[Dict] = []
-        for r in sample_rows:
-            out.append({
-                "Date": date,
-                "Customer": customer,
-                "Planner": planner,
-                "Product": product,
-                "Rated Current": rated,
-                "Cable Length": cable,
-                "Description": description,
-                "Delivery Term": r["Delivery Term"],
-                "MOQ": r["MOQ"],
-                "Price": r["Price"],
-                "L/T": (r["L/T"] + "wks") if r.get("L/T") else "",
-                "Remark": "",
-            })
-        return out
+    if is_sample(text):
 
-    # Mass production (MOQ 20/50 등)
-    pairs = _extract_moq_price_pairs(text)  # 기대: 6개 (3 term * 2 MOQ)
-    lts = _extract_lts(text)                # 기대: 2개(6-8,8-10) 또는 3개
+        rows = parse_sample(text)
 
-    # LT 매핑 보정(관측된 양산 템플릿 기준)
-    if len(lts) >= 3:
-        term_lts = lts[:3]
-    elif len(lts) == 2:
-        term_lts = [lts[0], lts[1], lts[0]]
-    elif len(lts) == 1:
-        term_lts = [lts[0], lts[0], lts[0]]
-    else:
-        term_lts = ["", "", ""]
-
-    out: List[Dict] = []
-    for i, term in enumerate(DELIVERY_TERMS):
-        chunk = pairs[i * 2:(i * 2) + 2]
-        for moq, price in chunk:
-            lt = term_lts[i]
+        for term, q, p, lt in rows:
             out.append({
                 "Date": date,
                 "Customer": customer,
@@ -248,9 +204,35 @@ def parse_sinbon_quote(text: str) -> List[Dict]:
                 "Cable Length": cable,
                 "Description": description,
                 "Delivery Term": term,
-                "MOQ": moq,
-                "Price": price,
-                "L/T": (lt + "wks") if lt else "",
+                "MOQ": q,
+                "Price": p,
+                "L/T": lt + "wks",
+                "Remark": "",
+            })
+
+        return out
+
+    # Mass
+    data, lts = parse_mass(text)
+
+    for i, term in enumerate(DELIVERY_TERMS):
+
+        chunk = data[i*2:(i+1)*2]
+
+        for q, p in chunk:
+
+            out.append({
+                "Date": date,
+                "Customer": customer,
+                "Planner": planner,
+                "Product": product,
+                "Rated Current": rated,
+                "Cable Length": cable,
+                "Description": description,
+                "Delivery Term": term,
+                "MOQ": q,
+                "Price": p,
+                "L/T": lts[i] + "wks" if lts[i] else "",
                 "Remark": "",
             })
 
