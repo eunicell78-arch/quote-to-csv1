@@ -2,7 +2,7 @@ import re
 from typing import List, Dict, Tuple
 from dateutil import parser as dateparser
 
-VERSION = "v2026-02-05-sample3termfix2"
+VERSION = "v2026-02-05-sample3termfix3"
 
 OUT_COLS = [
     "Date", "Customer", "Planner", "Product",
@@ -108,74 +108,88 @@ def _valid_lt(a: int, b: int) -> bool:
     return 1 <= a <= 30 and 1 <= b <= 30
 
 
+def _extract_price_lt_from_match(m) -> Tuple[float, str] | Tuple[None, None]:
+    price = float(m.group(1).replace(",", ""))
+    a = int(m.group(2))
+    b = int(m.group(3))
+    if not _valid_lt(a, b):
+        return None, None
+    return price, f"{a}-{b}"
+
+
 # ---------------- SAMPLE ----------------
 
 def is_sample(t: str) -> bool:
     return bool(re.search(r"\bSample\b", t, re.I))
 
 
-def _extract_price_lt(m) -> Tuple[float, str] | Tuple[None, None]:
-    price = float(m.group(1).replace(",", ""))
-    a = int(m.group(2)); b = int(m.group(3))
-    if not _valid_lt(a, b):
+def _find_term_price_lt(flat: str, anchor_pat: str) -> Tuple[float, str] | Tuple[None, None]:
+    """
+    anchor_pat(운임 키워드)을 찾은 뒤, 그 '근처'에서 $price + lt 를 찾는다.
+    문구가 쪼개져도 되도록 anchor_pat은 느슨하게 작성.
+    """
+    am = re.search(anchor_pat, flat, flags=re.I)
+    if not am:
         return None, None
-    return price, f"{a}-{b}"
+
+    tail = flat[am.end(): am.end() + 260]
+
+    # $는 없어도 되게
+    pm = re.search(r"\$?\s*([\d,]+\.\d{2})\s+(\d{1,2})\s*-\s*(\d{1,2})", tail)
+    if not pm:
+        return None, None
+
+    return _extract_price_lt_from_match(pm)
 
 
 def parse_sample(t: str) -> List[Tuple[str, int, float, str]]:
-    """
-    샘플 2종 지원:
-    - 1줄형: 1 FOB SH Sample $535.62 4-6
-    - 3줄형: FOB SH ... / DAP KR BY SEA/FERRY ... / DAP KR BY AIR ...
-      (줄바꿈으로 DAP KR BY / AIR / $... 형태로 쪼개져도 FLAT에서 직접 매칭)
-    """
     f = FLAT(t)
 
-    # (1) 1줄형: '1 ... FOB SH ... Sample ... $price lt'
+    # (1) 1줄형 샘플: "1 ... FOB SH ... Sample ... $xxx.xx 4-6"
     m = re.search(
-        r"\b1\s+.*?\bFOB\s*SH\b.*?\bSample\b.*?\$?\s*([\d,]+\.\d{2})\s+(\d{1,2})\s*-\s*(\d{1,2})\b",
+        r"\b1\b.*?\bFOB\s*SH\b.*?\bSample\b.*?\$?\s*([\d,]+\.\d{2})\s+(\d{1,2})\s*-\s*(\d{1,2})\b",
         f, re.I
     )
     if m:
-        price, lt = _extract_price_lt(m)
+        price, lt = _extract_price_lt_from_match(m)
         if price is not None:
             return [("FOB SH", 1, price, lt)]
 
-    # (2) 3줄형: term별로 직접 매칭 (가장 안정적)
-    # term 뒤에 $가 다음 줄로 내려가도 FLAT에서는 공백으로 붙으므로 \s*로 처리 가능
-    term_patterns = [
-        ("FOB SH",
-         r"\bFOB\s*SH\b\s*\$?\s*([\d,]+\.\d{2})\s+(\d{1,2})\s*-\s*(\d{1,2})\b"),
-        ("DAP KR BY SEA/FERRY",
-         r"\bDAP\s*KR\s*BY\s*SEA\s*/\s*FERRY\b\s*\$?\s*([\d,]+\.\d{2})\s+(\d{1,2})\s*-\s*(\d{1,2})\b"),
-        ("DAP KR BY AIR",
-         r"\bDAP\s*KR\s*BY\s*AIR\b\s*\$?\s*([\d,]+\.\d{2})\s+(\d{1,2})\s*-\s*(\d{1,2})\b"),
-    ]
+    rows: Dict[str, Tuple[str, int, float, str]] = {}
 
-    out: List[Tuple[str, int, float, str]] = []
-    for term, pat in term_patterns:
-        m = re.search(pat, f, re.I)
-        if not m:
-            continue
-        price, lt = _extract_price_lt(m)
-        if price is None:
-            continue
-        out.append((term, 1, price, lt))
+    # (2) 3줄형 샘플: 문구가 심하게 쪼개져도 잡히도록 "근접 키워드" 기반으로 탐색
+    # FOB: "FOB" + "SH"
+    price, lt = _find_term_price_lt(f, r"\bFOB\b\s*SH\b")
+    if price is not None:
+        rows["FOB SH"] = ("FOB SH", 1, price, lt)
 
-    # 표준 순서 유지
-    ordered = []
+    # SEA/FERRY: "SEA" 근처에 "FERRY"가 함께 등장하는 구간을 anchor로
+    # DAP KR BY 가 있으면 더 좋지만 없을 수도 있어서 SEA+FERRY 위주로 찾음
+    price, lt = _find_term_price_lt(f, r"\bSEA\b(?:.{0,40})\bFERRY\b")
+    if price is not None:
+        rows["DAP KR BY SEA/FERRY"] = ("DAP KR BY SEA/FERRY", 1, price, lt)
+
+    # AIR: "DAP KR BY" 근처에 AIR가 등장하는 구간을 우선, 없으면 AIR 단독으로 보조
+    price, lt = _find_term_price_lt(f, r"\bDAP\b(?:.{0,30})\bKR\b(?:.{0,30})\bBY\b(?:.{0,30})\bAIR\b")
+    if price is not None:
+        rows["DAP KR BY AIR"] = ("DAP KR BY AIR", 1, price, lt)
+    else:
+        price, lt = _find_term_price_lt(f, r"\bAIR\b")
+        if price is not None:
+            rows["DAP KR BY AIR"] = ("DAP KR BY AIR", 1, price, lt)
+
+    # 표준 순서로 반환
+    ordered: List[Tuple[str, int, float, str]] = []
     for term in ["FOB SH", "DAP KR BY SEA/FERRY", "DAP KR BY AIR"]:
-        for r in out:
-            if r[0] == term:
-                ordered.append(r)
-                break
+        if term in rows:
+            ordered.append(rows[term])
+
     return ordered
 
 
 # ---------------- MASS ----------------
 
 def parse_mass(t: str):
-    # MOQ + Price
     pairs = re.findall(r"(\d+)\s+\$([\d,]+\.\d{2})", t)
     data = []
     for q, p in pairs:
@@ -184,17 +198,16 @@ def parse_mass(t: str):
         except:
             pass
 
-    # LT 후보: 1~30만
     raw_lts = re.findall(r"\b(\d{1,2})\s*-\s*(\d{1,2})\b", t)
     lts = []
     for a, b in raw_lts:
-        a = int(a); b = int(b)
+        a = int(a)
+        b = int(b)
         if _valid_lt(a, b):
             lt = f"{a}-{b}"
             if lt not in lts:
                 lts.append(lt)
 
-    # 템플릿 보정: FOB=첫번째, SEA=두번째, AIR=첫번째
     if len(lts) == 2:
         lts = [lts[0], lts[1], lts[0]]
     if len(lts) == 1:
@@ -218,7 +231,6 @@ def parse_sinbon_quote(text: str) -> List[Dict]:
 
     out: List[Dict] = []
 
-    # Sample
     if is_sample(text):
         rows = parse_sample(text)
         for term, q, p, lt in rows:
@@ -238,9 +250,7 @@ def parse_sinbon_quote(text: str) -> List[Dict]:
             })
         return out
 
-    # Mass
     data, lts = parse_mass(text)
-
     for i, term in enumerate(DELIVERY_TERMS):
         chunk = data[i*2:(i+1)*2]
         for q, p in chunk:
