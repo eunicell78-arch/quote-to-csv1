@@ -2,13 +2,15 @@ import re
 import pdfplumber
 from dateutil import parser as dateparser
 
-VERSION = "v2026-02-05-quote-layout-v1a"
+VERSION = "v2026-02-05-quote-layout-v1b-fallback"
 
 OUT_COLS = [
     "Date", "Customer", "Planner", "Product",
     "Rated Current", "Cable Length", "Description",
     "Delivery Term", "MOQ", "Price", "L/T", "Remark"
 ]
+
+# ---------------- utils ----------------
 
 def N(s):
     return re.sub(r"\s+", " ", (s or "").strip())
@@ -51,52 +53,52 @@ def parse_date_from_text(t):
     return ""
 
 def parse_to_from(t):
+    """
+    조건:
+    Customer=To, Planner=From
+    To/From가 같은 줄에 있을 수 있으니 non-greedy로 분리
+    """
     cust = ""
     planner = ""
+
+    m = re.search(r"\bTo:\s*(.*?)\s+From:\s*(.*?)(?:\n|$)", t, re.I)
+    if m:
+        cust = N(m.group(1))
+        planner = N(m.group(2))
+        return cust, planner
+
     m = re.search(r"\bTo:\s*([^\n]+)", t, re.I)
     if m:
         cust = N(m.group(1))
+
     m = re.search(r"\bFrom:\s*([^\n]+)", t, re.I)
     if m:
         planner = N(m.group(1))
+
     return cust, planner
 
 def is_sample_token(s):
-    return bool(re.search(r"\bSample\b", s, re.I))
+    return bool(re.search(r"\bSample\b", s or "", re.I))
 
 def is_nre_token(s):
-    return bool(re.search(r"\bNRE\s*List\b", s, re.I))
+    return bool(re.search(r"\bNRE\s*List\b", s or "", re.I))
 
 def strip_bullet(s):
     return N(re.sub(r"^[\-\u2022•]+", "", (s or "").strip()))
 
-def cluster_lines(words, y_tol=3.0):
-    if not words:
-        return []
-    ws = sorted(words, key=lambda w: (w["top"], w["x0"]))
-    lines = []
-    for w in ws:
-        if not lines:
-            lines.append([w])
-            continue
-        if abs(w["top"] - lines[-1][0]["top"]) <= y_tol:
-            lines[-1].append(w)
-        else:
-            lines.append([w])
-    return lines
+# ---------------- Product parsing by your rules ----------------
 
-def words_to_text(words):
-    lines = cluster_lines(words, y_tol=3.0)
-    out_lines = []
-    for ln in lines:
-        ln_sorted = sorted(ln, key=lambda w: w["x0"])
-        out_lines.append(N(" ".join(w["text"] for w in ln_sorted)))
-    return "\n".join([x for x in out_lines if x])
-
-def split_product_cell_by_rules(product_cell_text):
-    raw = product_cell_text or ""
-    lines = [strip_bullet(x) for x in raw.split("\n") if strip_bullet(x)]
-    if not lines:
+def split_product_block(lines):
+    """
+    조건
+    4.Product = Rated Current 기준으로 윗줄
+    5.Rated Current = Rated Current 라인 값
+    6.Cable Length = Cable Length 라인 값
+    7.Description = Cable Length 아래 라인들
+    e.Description에 Rated/Cable 반복 금지
+    """
+    clean = [strip_bullet(x) for x in lines if strip_bullet(x)]
+    if not clean:
         return "", "", "", ""
 
     rated_idx = None
@@ -104,7 +106,7 @@ def split_product_cell_by_rules(product_cell_text):
     rated_val = ""
     cable_val = ""
 
-    for i, ln in enumerate(lines):
+    for i, ln in enumerate(clean):
         if re.search(r"Rated\s*Current", ln, re.I):
             rated_idx = i
             parts = ln.split(":", 1)
@@ -115,23 +117,21 @@ def split_product_cell_by_rules(product_cell_text):
             cable_val = N(parts[1]) if len(parts) == 2 else N(ln)
 
     if rated_idx is not None and rated_idx - 1 >= 0:
-        product_name = lines[rated_idx - 1]
+        product_name = clean[rated_idx - 1]
     else:
-        product_name = lines[0]
+        product_name = clean[0]
 
     desc_parts = []
     if cable_idx is not None:
-        after = lines[cable_idx + 1:]
+        after = clean[cable_idx + 1:]
         for ln in after:
-            if re.search(r"Rated\s*Current", ln, re.I):
+            if re.search(r"Rated\s*Current|Cable\s*Length", ln, re.I):
                 continue
-            if re.search(r"Cable\s*Length", ln, re.I):
-                continue
-            if ln:
-                desc_parts.append(ln)
+            desc_parts.append(ln)
     else:
-        start = (rated_idx + 1) if rated_idx is not None else 1
-        for ln in lines[start:]:
+        # cable length가 없으면 rated 아래 라인을 desc로
+        start = rated_idx + 1 if rated_idx is not None else 1
+        for ln in clean[start:]:
             if re.search(r"Rated\s*Current|Cable\s*Length", ln, re.I):
                 continue
             desc_parts.append(ln)
@@ -139,135 +139,115 @@ def split_product_cell_by_rules(product_cell_text):
     desc = "; ".join([x for x in desc_parts if x])
     return product_name, rated_val, cable_val, desc
 
-def find_header_y_and_columns(words):
-    keys = {
-        "item": ["item"],
-        "product": ["product"],
-        "delivery": ["delivery", "term"],
-        "moq": ["moq", "qty"],
-        "price": ["unit", "price"],
-        "lt": ["l/t", "wks", "weeks", "lt"],
-        "remark": ["remark"],
-    }
+# ============================================================
+#  FALLBACK TEXT PARSER (핵심)
+# ============================================================
 
-    candidates = []
-    for w in words:
-        t = w["text"].lower()
-        for k, toks in keys.items():
-            if t in toks:
-                candidates.append((k, w))
-                break
+def parse_by_text_fallback(text):
+    """
+    extract_words가 글자 단위로 쪼개지는 PDF 대응:
+    extract_text() 기반으로 Item row를 찾아 파싱한다.
+    """
+    lines = [x.rstrip() for x in (text or "").splitlines()]
+    lines = [x for x in lines if N(x)]
 
-    if not candidates:
-        return None, None, None
+    # 1) 글로벌 LT (샘플)
+    lt = ""
+    mlt = re.search(r"\b(\d{1,2})\s*-\s*(\d{1,2})\b", text)
+    if mlt:
+        lt = add_wks(f"{mlt.group(1)}-{mlt.group(2)}")
 
-    buckets = {}
-    for k, w in candidates:
-        b = int(w["top"] // 5)
-        buckets.setdefault(b, []).append((k, w))
+    # 2) 글로벌 Delivery Term: "FOB ... Shanghai" 같이 찢어져도 잡기
+    delivery_global = ""
+    mdel = re.search(r"\b(FOB|DAP|EXW|CIF|DDP)\b[\s\S]{0,120}?\b(Shanghai|SH)\b", text, re.I)
+    if mdel:
+        delivery_global = f"{mdel.group(1).upper()} {mdel.group(2)}"
+        delivery_global = delivery_global.replace("SH", "SH").replace("Shanghai", "Shanghai")
 
-    def score(bucket_items):
-        present = {k for k, _ in bucket_items}
-        base = 0
-        for need in ["item", "product", "moq", "price"]:
-            if need in present:
-                base += 2
-        for opt in ["delivery", "lt", "remark"]:
-            if opt in present:
-                base += 1
-        return base
+    # 3) Item price line 찾기: "1 1 $497.83"
+    item_lines = []
+    for i, ln in enumerate(lines):
+        # item, moq, $price 패턴
+        if re.search(r"^\s*\d+\s+(?:\d+|Sample)\s+\$?[\d,]+\.\d{2}\s*$", ln):
+            item_lines.append((i, ln))
 
-    best_bucket = max(buckets.items(), key=lambda kv: score(kv[1]))[0]
-    header_items = buckets[best_bucket]
+    if not item_lines:
+        return []
 
-    header_bottom = max(w["bottom"] for _, w in header_items)
+    out_rows = []
 
-    x_positions = {}
-    for k, w in header_items:
-        if k not in x_positions:
-            x_positions[k] = w["x0"]
+    for idx, (li, ln) in enumerate(item_lines):
+        m = re.search(r"^\s*(\d+)\s+(\d+|Sample)\s+\$?([\d,]+\.\d{2})\s*$", ln)
+        if not m:
+            continue
+
+        item_no = int(m.group(1))
+        moq_token = m.group(2)
+        price = money_to_float(m.group(3))
+
+        # MOQ / Sample 처리
+        remark_add = ""
+        if is_sample_token(moq_token):
+            moq_val = 1
+            remark_add = "Sample"
         else:
-            x_positions[k] = min(x_positions[k], w["x0"])
+            moq_val = int(moq_token)
 
-    if "product" not in x_positions or "moq" not in x_positions or "price" not in x_positions:
-        return None, None, None
+        # 제품 블록 범위:
+        # - 위로 올라가면서 "Charging Cable" 같은 제품명 라인 찾기
+        p_start = li - 1
+        while p_start >= 0:
+            up = lines[p_start]
+            if re.search(r"\bCharging\s+Cable\b", up, re.I) and not up.lower().startswith("item"):
+                break
+            p_start -= 1
 
-    order = ["item", "product", "delivery", "moq", "price", "lt", "remark"]
-    xs = [(k, x_positions[k]) for k in order if k in x_positions]
-    xs.sort(key=lambda kv: kv[1])
+        # 아래로는 다음 제품명(또는 다음 item price line 전)까지
+        p_end = li + 1
+        next_item_line_index = item_lines[idx + 1][0] if idx + 1 < len(item_lines) else len(lines)
+        while p_end < next_item_line_index:
+            # 다음 제품명 만나면 stop (다만 어떤 파일은 제품명이 반복되므로 item 경계가 더 신뢰됨)
+            p_end += 1
 
-    col_ranges = {}
-    for i, (k, x) in enumerate(xs):
-        left = x - 2
-        right = (xs[i + 1][1] - 2) if i + 1 < len(xs) else 1e9
-        if i > 0:
-            left = (xs[i - 1][1] + x) / 2
-        if i + 1 < len(xs):
-            right = (x + xs[i + 1][1]) / 2
-        col_ranges[k] = (left, right)
+        block_lines = lines[p_start:p_end] if p_start >= 0 else lines[max(0, li-10):p_end]
 
-    return header_bottom, None, col_ranges
+        product_name, rated, cable, desc = split_product_block(block_lines)
 
-def collect_table_region_words(words, header_bottom):
-    return [w for w in words if w["top"] > header_bottom + 1]
+        # Delivery term: 블록 안에서 FOB/DAP/EXW 등 탐색, 없으면 글로벌
+        delivery = ""
+        btxt = "\n".join(block_lines)
+        mdt = re.search(r"\b(FOB|DAP|EXW|CIF|DDP)\b[\s\S]{0,40}?\b(Shanghai|SH|Korea|Busan|Incheon)\b", btxt, re.I)
+        if mdt:
+            delivery = f"{mdt.group(1).upper()} {mdt.group(2)}"
+        else:
+            delivery = delivery_global
 
-def find_notes_top(words):
-    for w in words:
-        if w["text"].strip().lower().startswith("notes"):
-            return w["top"]
-    return None
+        # NRE List 케이스
+        if is_nre_token(delivery) or is_nre_token(btxt) or is_nre_token(text):
+            delivery = "NRE List"
+            mcav = re.search(r"\bCavity\s*\d+\b", btxt, re.I)
+            if mcav:
+                cav = mcav.group(0)
+                if cav and cav not in desc:
+                    desc = (desc + "; " + cav).strip("; ").strip()
 
-def extract_rows_by_item_anchor(table_words, col_ranges, notes_top):
-    if notes_top is not None:
-        table_words = [w for w in table_words if w["top"] < notes_top - 2]
+        out_rows.append({
+            "Product": product_name,
+            "Rated Current": rated,
+            "Cable Length": cable,
+            "Description": desc,
+            "Delivery Term": delivery,
+            "MOQ": moq_val,
+            "Price": price,
+            "L/T": lt,
+            "Remark_add": remark_add
+        })
 
-    item_range = col_ranges.get("item")
-    if not item_range:
-        return []
+    return out_rows
 
-    def in_col(w, rng):
-        cx = (w["x0"] + w["x1"]) / 2
-        return rng[0] <= cx <= rng[1]
-
-    item_words = []
-    for w in table_words:
-        if in_col(w, item_range) and re.fullmatch(r"\d{1,3}", w["text"].strip()):
-            item_words.append(w)
-
-    if not item_words:
-        return []
-
-    item_words = sorted(item_words, key=lambda w: w["top"])
-
-    spans = []
-    for i, iw in enumerate(item_words):
-        start_y = iw["top"] - 2
-        end_y = (item_words[i + 1]["top"] - 2) if i + 1 < len(item_words) else 1e9
-        spans.append((start_y, end_y))
-
-    rows = []
-    for (sy, ey) in spans:
-        row_words = [w for w in table_words if sy <= w["top"] < ey]
-        row = {}
-        for k, rng in col_ranges.items():
-            cell_words = [w for w in row_words if in_col(w, rng)]
-            row[k] = words_to_text(cell_words)
-        rows.append(row)
-
-    return rows
-
-def fill_down(rows, keys):
-    prev = {k: "" for k in keys}
-    out = []
-    for r in rows:
-        rr = dict(r)
-        for k in keys:
-            if not N(rr.get(k, "")):
-                rr[k] = prev.get(k, "")
-            else:
-                prev[k] = rr[k]
-        out.append(rr)
-    return out
+# ============================================================
+#  MAIN: parse_quote_file (좌표 실패하면 fallback)
+# ============================================================
 
 def parse_quote_file(file_obj):
     debug = {}
@@ -293,83 +273,35 @@ def parse_quote_file(file_obj):
     debug["planner"] = planner
     debug["words_count"] = len(all_words)
 
-    header_bottom, _, col_ranges = find_header_y_and_columns(all_words)
-    debug["header_bottom"] = header_bottom
-    debug["col_ranges"] = col_ranges
+    # ✅ 좌표 헤더 탐지(단어가 글자 단위로 쪼개지는 PDF는 실패할 수 있음)
+    # -> 이번 케이스는 fallback으로 처리
+    # (header 탐지 로직을 더 복잡하게 만들기보다, text 기반이 더 안정적)
 
-    if header_bottom is None or col_ranges is None:
+    rows = parse_by_text_fallback(text)
+    debug["fallback_rows"] = len(rows)
+
+    if not rows:
         return [], debug
-
-    notes_top = find_notes_top(all_words)
-    debug["notes_top"] = notes_top
-
-    table_words = collect_table_region_words(all_words, header_bottom)
-    debug["table_words_count"] = len(table_words)
-
-    rows_raw = extract_rows_by_item_anchor(table_words, col_ranges, notes_top)
-    debug["rows_raw_count"] = len(rows_raw)
-
-    if not rows_raw:
-        return [], debug
-
-    rows_filled = fill_down(rows_raw, keys=["delivery", "moq", "lt", "remark"])
-    debug["rows_filled_count"] = len(rows_filled)
 
     out = []
-
-    for r in rows_filled:
-        product_cell = r.get("product", "")
-        delivery = N(r.get("delivery", ""))
-        moq_cell = N(r.get("moq", ""))
-        price_cell = N(r.get("price", ""))
-        lt_cell = N(r.get("lt", ""))
-        remark_cell = N(r.get("remark", ""))
-
-        if not any([product_cell, delivery, moq_cell, price_cell, lt_cell, remark_cell]):
-            continue
-
-        product_name, rated, cable, desc = split_product_cell_by_rules(product_cell)
-        lt = add_wks(lt_cell)
-
-        remark_add = ""
-        if is_sample_token(moq_cell):
-            moq_val = 1
-            remark_add = "Sample"
-        else:
-            mqty = re.search(r"\b(\d+)\b", moq_cell)
-            if not mqty:
-                continue
-            moq_val = int(mqty.group(1))
-
-        price = money_to_float(price_cell)
-        if price is None:
-            continue
-
-        # NRE List special
-        if is_nre_token(delivery) or is_nre_token(product_cell) or is_nre_token(text):
-            delivery = "NRE List"
-            mcav = re.search(r"\bCavity\s*\d+\b", product_cell, re.I)
-            if mcav:
-                cav = mcav.group(0)
-                if cav and cav not in desc:
-                    desc = (desc + "; " + cav).strip("; ").strip()
-
-        remark = "; ".join([x for x in [remark_cell, remark_add] if N(x)])
+    for r in rows:
+        remark = N(r.get("Remark_add", ""))
 
         out.append({
             "Date": date,
             "Customer": customer,
             "Planner": planner,
-            "Product": product_name,
-            "Rated Current": rated,
-            "Cable Length": cable,
-            "Description": desc,
-            "Delivery Term": delivery,
-            "MOQ": moq_val,
-            "Price": price,
-            "L/T": lt,
-            "Remark": remark,
+            "Product": r.get("Product", ""),
+            "Rated Current": r.get("Rated Current", ""),
+            "Cable Length": r.get("Cable Length", ""),
+            "Description": r.get("Description", ""),
+            "Delivery Term": r.get("Delivery Term", ""),
+            "MOQ": r.get("MOQ", ""),
+            "Price": r.get("Price", ""),
+            "L/T": r.get("L/T", ""),
+            "Remark": remark
         })
 
     debug["out_count"] = len(out)
     return out, debug
+
