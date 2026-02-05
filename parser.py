@@ -2,6 +2,7 @@ import re
 from typing import List, Dict, Tuple
 from dateutil import parser as dateparser
 
+VERSION = "v2026-02-05-sample3termfix"
 
 OUT_COLS = [
     "Date", "Customer", "Planner", "Product",
@@ -58,7 +59,6 @@ def get_customer_planner(t: str) -> Tuple[str, str]:
 # ---------------- PRODUCT / SPEC ----------------
 
 def _clean_rated(x: str) -> str:
-    # 200A/250A 형태 우선, 아니면 250A 같은 단일값
     m = re.search(r"\d+\s*A\s*/\s*\d+\s*A", x, re.I)
     if m:
         return m.group(0).replace(" ", "")
@@ -69,7 +69,6 @@ def _clean_rated(x: str) -> str:
 
 
 def _clean_cable(x: str) -> str:
-    # 3.5M / 4M / 6.5M / 7.62M 등만 남김
     m = re.search(r"\d+(?:\.\d+)?\s*M", x, re.I)
     if m:
         return m.group(0).replace(" ", "")
@@ -103,10 +102,9 @@ def get_product_specs(t: str) -> Tuple[str, str, str, List[str]]:
     return product, rated, cable, desc
 
 
-# ---------------- COMMON: LT FILTER (전화번호 방지) ----------------
+# ---------------- LT FILTER (전화번호 방지) ----------------
 
 def _valid_lt(a: int, b: int) -> bool:
-    # 리드타임은 보통 1~30주 범위. (전화번호 8640-4098 같은 건 자동 제외)
     return 1 <= a <= 30 and 1 <= b <= 30
 
 
@@ -116,63 +114,73 @@ def is_sample(t: str) -> bool:
     return bool(re.search(r"\bSample\b", t, re.I))
 
 
+def _find_price_lt_after(term_regex: str, flat: str) -> Tuple[float, str] | Tuple[None, None]:
+    """
+    term_regex가 등장한 '이후' 구간에서 가격과 L/T를 찾는다.
+    줄바꿈으로 term이 쪼개져도 FLAT에서 term_regex를 유연하게 매칭.
+    """
+    m = re.search(term_regex, flat, flags=re.I)
+    if not m:
+        return None, None
+
+    # term 다음부터 120자 안에서 가격 + lt 찾기 (너무 멀리 가면 오매칭 위험)
+    tail = flat[m.end(): m.end() + 200]
+
+    # $가 사라져도 잡히게: $는 optional
+    pm = re.search(r"\$?\s*([\d,]+\.\d{2})\s+(\d{1,2})\s*-\s*(\d{1,2})", tail)
+    if not pm:
+        return None, None
+
+    price = float(pm.group(1).replace(",", ""))
+    a = int(pm.group(2)); b = int(pm.group(3))
+    if not _valid_lt(a, b):
+        return None, None
+
+    return price, f"{a}-{b}"
+
+
 def parse_sample(t: str) -> List[Tuple[str, int, float, str]]:
-    """
-    샘플 견적은 구조가 흔들려도 아래 패턴을 '모두' 긁어오게 만듦.
-    - 1줄형: 1 FOB SH Sample $535.62 4-6
-    - 3줄형: FOB SH $... 4-6 / DAP KR BY SEA/FERRY $... 6-8 / DAP KR BY AIR $... 4-6
-    - 줄바꿈/순서 뒤섞임 대응: FLAT 텍스트에서 finditer로 전부 수집
-    """
     f = FLAT(t)
+    results: List[Tuple[str, int, float, str]] = []
 
-    # term 표준화 맵
-    def canon_term(raw: str) -> str:
-        r = N(raw).upper()
-        if r == "FOB SH":
-            return "FOB SH"
-        if r in ["SEA/FERRY", "DAP KR BY SEA/FERRY"]:
-            return "DAP KR BY SEA/FERRY"
-        if r in ["AIR", "DAP KR BY AIR"]:
-            return "DAP KR BY AIR"
-        return r
-
-    results: Dict[str, Tuple[str, int, float, str]] = {}
-
-    # (1) term + $price + lt 를 통으로 전부 긁기 (여러개 가능)
-    # DAP KR BY SEA/FERRY 문구가 일부만 나오기도 해서 (SEA/FERRY / AIR)도 허용
-    pattern = re.compile(
-        r"\b(FOB SH|DAP KR BY SEA/FERRY|DAP KR BY AIR|SEA/FERRY|AIR)\b"
-        r"\s+\$([\d,]+\.\d{2})\s+(\d{1,2})\s*-\s*(\d{1,2})\b",
-        re.I
+    # (A) 1줄형 샘플: "1 FOB SH Sample $xxx.xx 4-6"
+    m = re.search(
+        r"\b1\s+FOB\s*SH\b.*?\bSample\b.*?\$?\s*([\d,]+\.\d{2})\s+(\d{1,2})\s*-\s*(\d{1,2})\b",
+        f, re.I
     )
+    if m:
+        price = float(m.group(1).replace(",", ""))
+        a = int(m.group(2)); b = int(m.group(3))
+        if _valid_lt(a, b):
+            return [("FOB SH", 1, price, f"{a}-{b}")]
 
-    for m in pattern.finditer(f):
-        term = canon_term(m.group(1))
-        price = float(m.group(2).replace(",", ""))
-        a = int(m.group(3))
-        b = int(m.group(4))
-        if not _valid_lt(a, b):
-            continue
-        lt = f"{a}-{b}"
-        results[term] = (term, 1, price, lt)
+    # (B) 3줄형 샘플: term별로 각각 탐색 (줄바꿈으로 쪼개져도 OK)
+    # 핵심: "DAP KR BY"가 줄바꿈으로 분리돼도 잡히도록 \s* 허용
+    term_patterns = [
+        ("FOB SH", r"\bFOB\s*SH\b"),
+        ("DAP KR BY SEA/FERRY", r"\bDAP\s*KR\s*BY\s*SEA\s*/\s*FERRY\b|\bSEA\s*/\s*FERRY\b"),
+        ("DAP KR BY AIR", r"\bDAP\s*KR\s*BY\s*AIR\b|\bAIR\b"),
+    ]
 
-    # (2) 1줄형이 term/price/lt를 못 잡는 특이 케이스 대비:
-    # "Sample $price lt"만 있으면 FOB로 가정
-    if "FOB SH" in f.upper() and "SAMPLE" in f.upper() and not results:
-        m = re.search(r"\bSample\b\s+\$([\d,]+\.\d{2})\s+(\d{1,2})\s*-\s*(\d{1,2})\b", f, re.I)
-        if m:
-            price = float(m.group(1).replace(",", ""))
-            a = int(m.group(2))
-            b = int(m.group(3))
-            if _valid_lt(a, b):
-                results["FOB SH"] = ("FOB SH", 1, price, f"{a}-{b}")
+    for term, treg in term_patterns:
+        price, lt = _find_price_lt_after(treg, f)
+        if price is not None and lt is not None:
+            # AIR 패턴이 너무 넓어서(주소의 AIR 같은 오매칭) term이 DAP KR BY AIR로 실제 존재할 때 우선
+            if term == "DAP KR BY AIR":
+                # 가능하면 DAP KR BY AIR를 먼저 찾고, 없으면 AIR 단독도 허용
+                p2, lt2 = _find_price_lt_after(r"\bDAP\s*KR\s*BY\s*AIR\b", f)
+                if p2 is not None and lt2 is not None:
+                    price, lt = p2, lt2
+            results.append((term, 1, price, lt))
 
-    # 표준 출력 순서로 정렬
+    # 표준 순서로 정렬 + 중복 제거
     ordered = []
+    seen = set()
     for term in ["FOB SH", "DAP KR BY SEA/FERRY", "DAP KR BY AIR"]:
-        if term in results:
-            ordered.append(results[term])
-
+        for r in results:
+            if r[0] == term and term not in seen:
+                ordered.append(r)
+                seen.add(term)
     return ordered
 
 
@@ -188,7 +196,7 @@ def parse_mass(t: str):
         except:
             pass
 
-    # LT 후보 전부 수집 후 1~30 범위만 남김(전화번호 제거)
+    # LT 후보: 1~30만
     raw_lts = re.findall(r"\b(\d{1,2})\s*-\s*(\d{1,2})\b", t)
     lts = []
     for a, b in raw_lts:
@@ -198,7 +206,7 @@ def parse_mass(t: str):
             if lt not in lts:
                 lts.append(lt)
 
-    # 관측 템플릿 보정: FOB=첫번째, SEA=두번째, AIR=첫번째
+    # 템플릿 보정: FOB=첫번째, SEA=두번째, AIR=첫번째
     if len(lts) == 2:
         lts = [lts[0], lts[1], lts[0]]
     if len(lts) == 1:
@@ -266,3 +274,5 @@ def parse_sinbon_quote(text: str) -> List[Dict]:
             })
 
     return out
+
+
