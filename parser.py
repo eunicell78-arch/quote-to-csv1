@@ -16,8 +16,6 @@ DELIVERY_TERMS = [
 ]
 
 
-# ---------------- BASIC ----------------
-
 def N(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
@@ -49,21 +47,18 @@ def get_date(t: str) -> str:
 def get_customer_planner(t: str):
 
     customer = ""
-
     for c in re.findall(r"[A-Za-z0-9 ,.&()\-]+Co\., Ltd\.", t):
-        if "SINBON" not in c.upper():
+        if "SINBON" not in c.upper() and "JIANGYIN" not in c.upper():
             customer = N(c)
             break
 
     planner = "Sherry Liu" if "Sherry Liu" in t else ""
-
     return customer, planner
 
 
 # ---------------- PRODUCT / SPEC ----------------
 
 def _clean_rated(x: str) -> str:
-    # 200A/250A 형태까지만 남김
     m = re.search(r"\d+\s*A\s*/\s*\d+\s*A", x, re.I)
     if m:
         return m.group(0).replace(" ", "")
@@ -74,7 +69,6 @@ def _clean_rated(x: str) -> str:
 
 
 def _clean_cable(x: str) -> str:
-    # 3.5M / 4M / 7.62M 형태까지만 남김
     m = re.search(r"\d+(?:\.\d+)?\s*M", x, re.I)
     if m:
         return m.group(0).replace(" ", "")
@@ -99,7 +93,6 @@ def get_product_specs(t: str):
         cable = _clean_cable(m.group(1))
 
     desc = []
-
     m = re.search(r"Production\s*Site\s*:\s*([^\n\-•]+)", t, re.I)
     if m:
         desc.append("Production Site: " + N(m.group(1)))
@@ -121,29 +114,26 @@ def parse_sample(t: str):
     f = FLAT(t)
     rows = []
 
+    # Case 1: 1 FOB SH Sample $535.62 4-6
     m = re.search(
-        r"1\s+FOB SH\s+.*?Sample\s+\$([\d,]+\.\d{2})\s+(\d+-\d+)",
+        r"\b1\s+FOB SH\s+.*?\bSample\b\s+\$([\d,]+\.\d{2})\s+(\d{1,2}-\d{1,2})\b",
         f, re.I
     )
-
     if m:
-        rows.append(("FOB SH", 1,
-                     float(m.group(1).replace(",", "")),
-                     m.group(2)))
+        rows.append(("FOB SH", 1, float(m.group(1).replace(",", "")), m.group(2)))
         return rows
 
+    # Case 2: FOB / SEA / AIR blocks
     patterns = [
-        ("FOB SH", r"FOB SH\s+\$([\d,]+\.\d{2})\s+(\d+-\d+)"),
-        ("DAP KR BY SEA/FERRY", r"SEA/FERRY\s+\$([\d,]+\.\d{2})\s+(\d+-\d+)"),
-        ("DAP KR BY AIR", r"AIR\s+\$([\d,]+\.\d{2})\s+(\d+-\d+)"),
+        ("FOB SH", r"\bFOB SH\s+\$([\d,]+\.\d{2})\s+(\d{1,2}-\d{1,2})\b"),
+        ("DAP KR BY SEA/FERRY", r"\bSEA/FERRY\s+\$([\d,]+\.\d{2})\s+(\d{1,2}-\d{1,2})\b"),
+        ("DAP KR BY AIR", r"\bAIR\s+\$([\d,]+\.\d{2})\s+(\d{1,2}-\d{1,2})\b"),
     ]
 
     for term, p in patterns:
         m = re.search(p, f, re.I)
         if m:
-            rows.append((term, 1,
-                         float(m.group(1).replace(",", "")),
-                         m.group(2)))
+            rows.append((term, 1, float(m.group(1).replace(",", "")), m.group(2)))
 
     return rows
 
@@ -151,19 +141,27 @@ def parse_sample(t: str):
 # ---------------- MASS ----------------
 
 def parse_mass(t: str):
-
+    # MOQ + Price
     pairs = re.findall(r"(\d+)\s+\$([\d,]+\.\d{2})", t)
     data = []
-
     for q, p in pairs:
         try:
             data.append((int(q), float(p.replace(",", ""))))
         except:
             pass
 
-    lts = re.findall(r"\b(\d+-\d+)\b", t)
-    lts = list(dict.fromkeys(lts))
+    # ✅ L/T는 "작은 숫자 범위"만 허용해서 전화번호(8640-4098 등) 제외
+    # 허용 범위: 1~30 (필요시 40까지 늘려도 됨)
+    raw_lts = re.findall(r"\b(\d{1,2})\s*-\s*(\d{1,2})\b", t)
+    lts = []
+    for a, b in raw_lts:
+        a, b = int(a), int(b)
+        if 1 <= a <= 30 and 1 <= b <= 30:
+            lt = f"{a}-{b}"
+            if lt not in lts:
+                lts.append(lt)
 
+    # 관측된 템플릿 보정(FOB=첫번째, SEA=두번째, AIR=첫번째)
     if len(lts) == 2:
         lts = [lts[0], lts[1], lts[0]]
     if len(lts) == 1:
@@ -186,14 +184,11 @@ def parse_sinbon_quote(text: str) -> List[Dict]:
     product, rated, cable, desc = get_product_specs(text)
 
     description = "; ".join(desc)
-
     out = []
 
     # Sample
     if is_sample(text):
-
         rows = parse_sample(text)
-
         for term, q, p, lt in rows:
             out.append({
                 "Date": date,
@@ -209,18 +204,14 @@ def parse_sinbon_quote(text: str) -> List[Dict]:
                 "L/T": lt + "wks",
                 "Remark": "",
             })
-
         return out
 
     # Mass
     data, lts = parse_mass(text)
 
     for i, term in enumerate(DELIVERY_TERMS):
-
         chunk = data[i*2:(i+1)*2]
-
         for q, p in chunk:
-
             out.append({
                 "Date": date,
                 "Customer": customer,
@@ -232,7 +223,7 @@ def parse_sinbon_quote(text: str) -> List[Dict]:
                 "Delivery Term": term,
                 "MOQ": q,
                 "Price": p,
-                "L/T": lts[i] + "wks" if lts[i] else "",
+                "L/T": (lts[i] + "wks") if lts[i] else "",
                 "Remark": "",
             })
 
